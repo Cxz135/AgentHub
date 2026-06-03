@@ -315,11 +315,8 @@ const state = {
   runId: 'run_current',
   rightTab: 'agents',
   selectedAgentId: null,
-  missions: JSON.parse(JSON.stringify(MISSIONS)),
+  missions: MISSIONS,
   customSkills: [],
-  dashboardFilter: 'all',      // all | running | idle | completed | archived
-  dashboardSort: 'recent',     // recent | runs | name
-  topSearchQuery: '',
   // Skills 系统（market + mine）
   skills: { market: [], mine: [], loaded: false },
   skillsTab: 'mine',          // 'mine' | 'market'
@@ -332,8 +329,6 @@ const state = {
   // 详情页状态
   detail: null,               // { type:'agent'|'skill', missionId?, agentId?, skillId?, tab, draft, dirty, versionDropdownOpen }
   pendingDiff: null,
-  missionSettingsDraft: null,
-  missionSettingsDirty: false,
   quickRun: { turns: 0, conversation: [], promptedSave: false },
   // 用户登录态（null = 未登录）
   user: null,
@@ -494,103 +489,6 @@ function renderSideNav() {
 }
 
 /* ===== TopBar ===== */
-function getGlobalSearchResults(query) {
-  const q = (query || '').trim().toLowerCase();
-  if (!q) return [];
-  const results = [];
-  state.missions.forEach(m => {
-    const missionStatus = getMissionStatus(m);
-    const missionText = [m.name, m.description, m.icon, missionStatus].filter(Boolean).join(' ').toLowerCase();
-    if (missionText.includes(q)) {
-      results.push({
-        kind: 'mission',
-        missionId: m.id,
-        title: m.name,
-        subtitle: `${getMissionStatusLabel(missionStatus)} · ${m.runs.length} 次运行`,
-        icon: m.icon || 'task',
-      });
-    }
-    (m.runs || []).forEach(r => {
-      const runText = [r.title, r.status, r.lastActiveAt, r.startedAt].filter(Boolean).join(' ').toLowerCase();
-      if (runText.includes(q)) {
-        results.push({
-          kind: 'run',
-          missionId: m.id,
-          runId: r.id,
-          title: r.title,
-          subtitle: `${m.name} · ${r.status === 'running' ? '运行中' : r.status === 'idle' ? '待启动' : '已完成'}`,
-          icon: 'play_circle',
-        });
-      }
-    });
-    (m.squad?.agents || []).forEach(a => {
-      const agentText = [a.name, a.role, a.model, a.kind, ...(a.skills || [])].filter(Boolean).join(' ').toLowerCase();
-      if (agentText.includes(q)) {
-        results.push({
-          kind: 'agent',
-          missionId: m.id,
-          agentId: a.id,
-          title: a.name,
-          subtitle: `${m.name} · ${a.kind === 'team' ? 'Team' : 'Agent'} · ${a.model || '未设置模型'}`,
-          icon: a.icon || (a.kind === 'team' ? 'hub' : 'smart_toy'),
-        });
-      }
-    });
-  });
-  return results.slice(0, 8);
-}
-
-function setTopSearchQuery(v) {
-  state.topSearchQuery = v;
-  render();
-  setTimeout(() => document.getElementById('top-search-input')?.focus(), 0);
-}
-
-function clearTopSearch() {
-  state.topSearchQuery = '';
-  render();
-}
-
-function jumpToSearchResult(kind, missionId, entityId) {
-  state.topSearchQuery = '';
-  if (kind === 'mission') return openMission(missionId);
-  if (kind === 'run') return openRun(missionId, entityId);
-  if (kind === 'agent') return openAgentDetail(missionId, entityId, 'mine');
-}
-
-function renderTopSearchResults() {
-  const query = (state.topSearchQuery || '').trim();
-  if (!query) return '';
-  const results = getGlobalSearchResults(query);
-  if (!results.length) {
-    return `
-      <div class="absolute top-[calc(100%+8px)] left-0 right-0 bg-surface-container-lowest border border-outline-variant rounded-xl shadow-lg p-3 z-40">
-        <div class="text-center text-secondary py-4">
-          <span class="material-symbols-outlined text-[28px] opacity-40 block mb-1">search_off</span>
-          <p class="text-label-md">没有找到匹配内容</p>
-          <p class="text-[11px] mt-1">试试搜索 Mission、Run 标题或 Agent 名称</p>
-        </div>
-      </div>`;
-  }
-  return `
-    <div class="absolute top-[calc(100%+8px)] left-0 right-0 bg-surface-container-lowest border border-outline-variant rounded-xl shadow-lg overflow-hidden z-40">
-      ${results.map(r => `
-        <button onclick="jumpToSearchResult('${r.kind}','${r.missionId}','${r.runId || r.agentId || r.missionId}')"
-          class="w-full text-left px-3 py-2.5 border-b border-outline-variant/60 last:border-b-0 hover:bg-surface-container-low transition-colors">
-          <div class="flex items-center gap-3">
-            <div class="w-8 h-8 rounded-lg bg-surface-container flex items-center justify-center shrink-0">
-              <span class="material-symbols-outlined text-primary text-[17px]">${escapeHTML(r.icon)}</span>
-            </div>
-            <div class="min-w-0 flex-1">
-              <p class="text-label-md text-on-surface truncate">${escapeHTML(r.title)}</p>
-              <p class="text-[11px] text-secondary truncate">${escapeHTML(r.subtitle)}</p>
-            </div>
-            <span class="text-[10px] px-1.5 py-0.5 rounded bg-surface-container text-secondary uppercase">${r.kind}</span>
-          </div>
-        </button>`).join('')}
-    </div>`;
-}
-
 function renderTopBar() {
   let crumb, actions;
   if (state.view === 'dashboard') {
@@ -635,16 +533,8 @@ function renderTopBar() {
       <div class="flex-1 max-w-md mx-8">
         <div class="relative flex items-center">
           <span class="material-symbols-outlined absolute left-3 text-secondary text-[20px]">search</span>
-          <input id="top-search-input"
-                 value="${escapeAttr(state.topSearchQuery || '')}"
-                 oninput="setTopSearchQuery(this.value)"
-                 class="w-full bg-surface-container-lowest border border-outline-variant rounded-lg pl-10 pr-10 py-1.5 text-body-md focus:border-primary focus:ring-0 transition-all"
+          <input class="w-full bg-surface-container-lowest border border-outline-variant rounded-lg pl-10 pr-4 py-1.5 text-body-md focus:border-primary focus:ring-0 transition-all"
                  placeholder="搜索任务、智能体或运行记录..." type="text"/>
-          ${state.topSearchQuery ? `
-            <button onclick="clearTopSearch()" class="absolute right-3 text-secondary hover:text-primary">
-              <span class="material-symbols-outlined text-[18px]">close</span>
-            </button>` : ''}
-          ${renderTopSearchResults()}
         </div>
       </div>
       <div class="flex items-center gap-3">
@@ -711,22 +601,17 @@ function openKbDetail(kbId) {
 function confirmLeaveDirty() {
   const agentSkillDirty = state.detail && state.detail.dirty;
   const kbDirty = state.kbDetail && state.kbDetail.dirty;
-  const missionDirty = state.missionSettingsDirty;
-  if (agentSkillDirty || kbDirty || missionDirty) {
+  if (agentSkillDirty || kbDirty) {
     if (!confirm('当前有未保存的改动，确认离开？')) return false;
   }
   state.detail = null;
   state.kbDetail = null;
-  state.missionSettingsDraft = null;
-  state.missionSettingsDirty = false;
-  state.topSearchQuery = '';
   return true;
 }
 
 /* ===== Schema Migration / Defaults ===== */
 const MCP_STORAGE_KEY = 'agenthub_mcp_servers_v1';
 const CUSTOM_SKILLS_STORAGE_KEY = 'agenthub_custom_skills_v1';
-const MISSIONS_STORAGE_KEY = 'agenthub_missions_v1';
 
 function loadMcpServers() {
   if (state.mcpLoaded) return;
@@ -753,25 +638,6 @@ function loadCustomSkills() {
 function saveCustomSkills() {
   try { localStorage.setItem(CUSTOM_SKILLS_STORAGE_KEY, JSON.stringify(state.customSkills || [])); }
   catch (e) { console.warn('saveCustomSkills failed', e); }
-}
-
-function loadMissions() {
-  try {
-    const raw = localStorage.getItem(MISSIONS_STORAGE_KEY);
-    state.missions = raw ? JSON.parse(raw) : JSON.parse(JSON.stringify(MISSIONS));
-  } catch (e) {
-    state.missions = JSON.parse(JSON.stringify(MISSIONS));
-  }
-}
-
-function saveMissions() {
-  try { localStorage.setItem(MISSIONS_STORAGE_KEY, JSON.stringify(state.missions || [])); }
-  catch (e) { console.warn('saveMissions failed', e); }
-}
-
-function persistAppState() {
-  clearTimeout(persistAppState._t);
-  persistAppState._t = setTimeout(() => saveMissions(), 120);
 }
 
 function ensureAgentSchema(a) {
@@ -845,7 +711,6 @@ function getAgentKindMeta(kind) {
 /* ===== Main render ===== */
 function render() {
   ensureAllSchemas();
-  persistAppState();
   const app = $('#app');
   app.innerHTML = `
     ${renderSideNav()}
@@ -868,64 +733,12 @@ function render() {
 }
 
 /* ===================== Dashboard ===================== */
-function getMissionStatus(m) {
-  if (!m) return 'idle';
-  if (m.archived) return 'archived';
-  const runs = m.runs || [];
-  if (runs.some(r => r.status === 'running')) return 'running';
-  if (runs.length && runs.every(r => r.status === 'completed')) return 'completed';
-  return 'idle';
-}
-
-function getMissionStatusLabel(status) {
-  return status === 'running' ? '运行中'
-    : status === 'idle' ? '待启动'
-    : status === 'completed' ? '已完成'
-    : '已归档';
-}
-
-function getDashboardMissions() {
-  const filter = state.dashboardFilter || 'all';
-  const sort = state.dashboardSort || 'recent';
-  let list = [...(state.missions || [])];
-  if (filter !== 'all') {
-    list = list.filter(m => getMissionStatus(m) === filter);
-  }
-  if (sort === 'runs') {
-    list.sort((a, b) => (b.runs?.length || 0) - (a.runs?.length || 0) || a.name.localeCompare(b.name, 'zh-CN'));
-  } else if (sort === 'name') {
-    list.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN'));
-  } else {
-    const score = (m) => {
-      const status = getMissionStatus(m);
-      return (status === 'running' ? 1000 : status === 'idle' ? 500 : status === 'completed' ? 100 : 0) + ((m.runs || []).length || 0);
-    };
-    list.sort((a, b) => score(b) - score(a) || a.name.localeCompare(b.name, 'zh-CN'));
-  }
-  return list;
-}
-
-function cycleDashboardFilter() {
-  const order = ['all', 'running', 'idle', 'completed', 'archived'];
-  const idx = order.indexOf(state.dashboardFilter || 'all');
-  state.dashboardFilter = order[(idx + 1) % order.length];
-  render();
-}
-
-function cycleDashboardSort() {
-  const order = ['recent', 'runs', 'name'];
-  const idx = order.indexOf(state.dashboardSort || 'recent');
-  state.dashboardSort = order[(idx + 1) % order.length];
-  render();
-}
-
 function renderDashboard() {
   const userName = state.user ? state.user.username : 'there';
   const heading = `早上好，${escapeHTML(userName)} 👋`;
-  const visibleMissions = getDashboardMissions();
 
   // 统计数据
-  const missionCount = state.missions.filter(m => !m.archived).length;
+  const missionCount = state.missions.length;
   const runCount     = state.missions.reduce((n,m)=>n+m.runs.length,0);
   const skillCount   = BUILTIN_SKILLS.length + state.customSkills.length;
 
@@ -1014,18 +827,14 @@ function renderDashboard() {
     </div>`;
 
   // ===== 我的任务区 =====
-  const missionCards = visibleMissions.length ? visibleMissions.map(m => {
+  const missionCards = state.missions.map(m => {
     const lastRun = m.runs[0];
-    const missionStatus = getMissionStatus(m);
-    const statusBadge = missionStatus === 'running'
+    const statusBadge = lastRun.status === 'running'
       ? `<span class="flex items-center gap-1 text-primary text-label-sm font-bold">
            <span class="w-1.5 h-1.5 bg-primary rounded-full animate-pulse"></span>运行中</span>`
-      : missionStatus === 'idle'
+      : lastRun.status === 'idle'
       ? `<span class="flex items-center gap-1 text-secondary text-label-sm font-bold">
            <span class="w-1.5 h-1.5 bg-secondary rounded-full"></span>待启动</span>`
-      : missionStatus === 'archived'
-      ? `<span class="flex items-center gap-1 text-secondary text-label-sm font-bold">
-           <span class="material-symbols-outlined text-[14px]">inventory_2</span>已归档</span>`
       : `<span class="flex items-center gap-1 text-secondary text-label-sm font-bold">
            <span class="material-symbols-outlined text-[14px]">check_circle</span>已完成</span>`;
 
@@ -1057,12 +866,7 @@ function renderDashboard() {
           </div>
         </div>
       </div>`;
-  }).join('') : `
-    <div class="col-span-3 border border-dashed border-outline-variant rounded-xl p-xl text-center text-secondary bg-surface-container-lowest">
-      <span class="material-symbols-outlined text-[40px] opacity-40 mb-2 block">task_alt</span>
-      <p class="text-body-md">当前筛选下没有 Mission</p>
-      <p class="text-label-sm mt-1">切换筛选条件，或创建一个新的 Mission。</p>
-    </div>`;
+  }).join('');
 
   const addCard = `
     <div onclick="openCreateMission()"
@@ -1080,11 +884,11 @@ function renderDashboard() {
         <div class="flex items-center justify-between mb-md">
           <h3 class="text-headline-md text-on-surface">我的任务</h3>
           <div class="flex items-center gap-2 text-label-md text-secondary">
-            <button onclick="cycleDashboardFilter()" class="px-2 py-1 rounded hover:bg-surface-container-low flex items-center gap-1">
-              <span class="material-symbols-outlined text-[16px]">filter_list</span>筛选：${getMissionStatusLabel(state.dashboardFilter === 'all' ? 'idle' : state.dashboardFilter).replace('待启动','全部')}
+            <button class="px-2 py-1 rounded hover:bg-surface-container-low flex items-center gap-1">
+              <span class="material-symbols-outlined text-[16px]">filter_list</span>筛选
             </button>
-            <button onclick="cycleDashboardSort()" class="px-2 py-1 rounded hover:bg-surface-container-low flex items-center gap-1">
-              <span class="material-symbols-outlined text-[16px]">sort</span>排序：${state.dashboardSort === 'recent' ? '最近活跃' : state.dashboardSort === 'runs' ? '运行次数' : '名称'}
+            <button class="px-2 py-1 rounded hover:bg-surface-container-low flex items-center gap-1">
+              <span class="material-symbols-outlined text-[16px]">sort</span>排序
             </button>
           </div>
         </div>
@@ -1384,7 +1188,7 @@ function renderKPIMock(art) {
 /* ----- Right Editor ----- */
 function renderRightEditor() {
   const m = getMission();
-  const archived = !!m.archived && state.rightTab !== 'settings';
+  const archived = false; // legacy: Run 不再归档，所有右栏始终可写
   const tabs = [
     { id:'agents', label:'Team',   icon:'groups' },
     { id:'skills', label:'Tools',  icon:'build' },
@@ -1401,7 +1205,7 @@ function renderRightEditor() {
     <aside class="w-[360px] border-l border-outline-variant bg-surface-container-low flex flex-col shrink-0 ${archived ? 'pointer-events-none opacity-95' : ''}">
       <div class="h-[48px] border-b border-outline-variant px-3 flex items-center gap-1 shrink-0 bg-surface-container-low">
         ${tabs.map(t => `
-          <button onclick="switchMissionRightTab('${t.id}')"
+          <button onclick="state.rightTab='${t.id}';render()"
             class="flex-1 py-1.5 rounded-lg text-label-md flex items-center justify-center gap-1.5
                    ${state.rightTab===t.id ? 'bg-surface-container-lowest text-primary font-bold border border-outline-variant' : 'text-secondary hover:bg-surface-container'}">
             <span class="material-symbols-outlined text-[16px]">${t.icon}</span>${t.label}
@@ -1720,31 +1524,15 @@ function renderSkillsTab(m, archived) {
 }
 
 function renderSettingsTab(m, archived) {
-  const draft = ensureMissionSettingsState(m);
-  const dirty = state.missionSettingsDirty && draft && draft._missionId === m.id;
-  const archivedLabel = m.archived ? '恢复 Mission' : '归档此 Mission';
   return `
     <div class="p-md space-y-md">
-      <div class="flex items-center justify-between bg-surface-container-lowest border border-outline-variant rounded-lg px-3 py-2">
-        <div class="flex items-center gap-2">
-          <span class="material-symbols-outlined text-primary text-[18px]">tune</span>
-          <p class="font-label-md text-on-surface">Mission 设置</p>
-          <span id="mission-settings-dirty-dot" class="${dirty ? '' : 'hidden'} w-2 h-2 rounded-full bg-amber-500" title="有未保存改动"></span>
-        </div>
-        <button id="mission-settings-save-btn" onclick="saveMissionSettings()" ${dirty && !m.archived ? '' : 'disabled'}
-          class="px-3 py-1.5 rounded-lg text-label-md flex items-center gap-1.5 transition-colors ${dirty && !m.archived ? 'bg-primary text-white hover:opacity-90' : 'bg-surface-container text-secondary cursor-not-allowed'}">
-          <span class="material-symbols-outlined text-[16px]">save</span>保存
-        </button>
-      </div>
       <div>
         <p class="text-label-md text-secondary mb-1">Mission 名称</p>
-        <input ${m.archived?'disabled':''} class="w-full bg-surface-container-lowest border border-outline-variant rounded-lg px-3 py-2 text-body-md focus:border-primary focus:ring-0" value="${escapeAttr(draft.name || '')}"
-          oninput="state.missionSettingsDraft.name=this.value; markMissionSettingsDirty()"/>
+        <input ${archived?'disabled':''} class="w-full bg-surface-container-lowest border border-outline-variant rounded-lg px-3 py-2 text-body-md focus:border-primary focus:ring-0" value="${escapeHTML(m.name)}"/>
       </div>
       <div>
         <p class="text-label-md text-secondary mb-1">描述</p>
-        <textarea ${m.archived?'disabled':''} rows="3" class="w-full bg-surface-container-lowest border border-outline-variant rounded-lg px-3 py-2 text-body-md focus:border-primary focus:ring-0 resize-none"
-          oninput="state.missionSettingsDraft.description=this.value; markMissionSettingsDirty()">${escapeHTML(draft.description || '')}</textarea>
+        <textarea ${archived?'disabled':''} rows="3" class="w-full bg-surface-container-lowest border border-outline-variant rounded-lg px-3 py-2 text-body-md focus:border-primary focus:ring-0 resize-none">${escapeHTML(m.description)}</textarea>
       </div>
       <div class="bg-surface-container-lowest border border-outline-variant rounded-lg p-3">
         <p class="font-label-md text-on-surface mb-1 flex items-center gap-2">
@@ -1752,90 +1540,15 @@ function renderSettingsTab(m, archived) {
         </p>
         <p class="text-label-sm text-secondary mb-2">分派任务 + 解析自然语言编辑指令</p>
         <div class="flex gap-2">
-          <button onclick="setMissionCoordinatorMode('dispatch')" ${m.archived?'disabled':''}
-            class="flex-1 py-1.5 rounded border text-label-md ${draft.coordinatorMode === 'dispatch' ? 'border-primary bg-primary text-white' : 'border-outline-variant text-secondary hover:border-primary'}">分派</button>
-          <button onclick="setMissionCoordinatorMode('edit')" ${m.archived?'disabled':''}
-            class="flex-1 py-1.5 rounded border text-label-md ${draft.coordinatorMode === 'edit' ? 'border-primary bg-primary text-white' : 'border-outline-variant text-secondary hover:border-primary'}">编辑</button>
+          <button class="flex-1 py-1.5 rounded border border-primary bg-primary text-white text-label-md">分派</button>
+          <button class="flex-1 py-1.5 rounded border border-outline-variant text-secondary text-label-md hover:border-primary">编辑</button>
         </div>
       </div>
-      <div class="bg-surface-container-lowest border border-outline-variant rounded-lg p-3">
-        <p class="font-label-md text-on-surface mb-1">当前状态</p>
-        <p class="text-label-sm text-secondary">${m.archived ? '此 Mission 已归档，可在这里恢复。' : '此 Mission 正常可编辑，可随时归档。'}</p>
-      </div>
-      <button onclick="toggleMissionArchived()" class="w-full py-2 ${m.archived ? 'bg-primary-fixed text-on-primary-fixed-variant border-primary/30 hover:bg-primary-fixed/70' : 'bg-error-container text-on-error-container border-error/30 hover:bg-error hover:text-white'} border rounded-lg text-label-md transition-colors">
-        ${archivedLabel}
-      </button>
+      ${archived ? '' : `
+        <button class="w-full py-2 bg-error-container text-on-error-container border border-error/30 rounded-lg text-label-md hover:bg-error hover:text-white transition-colors">
+          归档此 Mission
+        </button>`}
     </div>`;
-}
-
-function switchMissionRightTab(tab) {
-  if (state.rightTab === tab) return;
-  if (state.rightTab === 'settings' && state.missionSettingsDirty) {
-    if (!confirm('当前 Mission 设置尚未保存，确认切换标签？')) return;
-    state.missionSettingsDirty = false;
-    state.missionSettingsDraft = null;
-  }
-  state.rightTab = tab;
-  render();
-}
-
-function ensureMissionSettingsState(m) {
-  if (!m) return null;
-  if (!state.missionSettingsDraft || state.missionSettingsDraft._missionId !== m.id) {
-    state.missionSettingsDraft = {
-      _missionId: m.id,
-      name: m.name || '',
-      description: m.description || '',
-      coordinatorMode: m.coordinatorMode || 'dispatch',
-    };
-    state.missionSettingsDirty = false;
-  }
-  return state.missionSettingsDraft;
-}
-
-function markMissionSettingsDirty() {
-  if (state.missionSettingsDirty) return;
-  state.missionSettingsDirty = true;
-  const saveBtn = document.getElementById('mission-settings-save-btn');
-  if (saveBtn) {
-    saveBtn.disabled = false;
-    saveBtn.className = 'px-3 py-1.5 rounded-lg text-label-md flex items-center gap-1.5 transition-colors bg-primary text-white hover:opacity-90';
-  }
-  const dot = document.getElementById('mission-settings-dirty-dot');
-  if (dot) dot.classList.remove('hidden');
-}
-
-function setMissionCoordinatorMode(mode) {
-  const draft = ensureMissionSettingsState(getMission());
-  if (!draft || draft.coordinatorMode === mode) return;
-  draft.coordinatorMode = mode;
-  state.missionSettingsDirty = true;
-  render();
-}
-
-function saveMissionSettings() {
-  const draft = ensureMissionSettingsState(getMission());
-  if (!draft) return;
-  if (!draft.name || !draft.name.trim()) return showToast('Mission 名称不能为空', 'error');
-  const m = getMission(draft._missionId);
-  if (!m) return showToast('Mission 不存在', 'error');
-  if (m.archived) return showToast('请先恢复 Mission，再进行编辑', 'error');
-  m.name = draft.name.trim();
-  m.description = (draft.description || '').trim();
-  m.coordinatorMode = draft.coordinatorMode || 'dispatch';
-  state.missionSettingsDirty = false;
-  showToast('Mission 设置已保存', 'success');
-  render();
-}
-
-function toggleMissionArchived() {
-  const m = getMission();
-  if (!m) return;
-  m.archived = !m.archived;
-  state.missionSettingsDraft = null;
-  state.missionSettingsDirty = false;
-  showToast(m.archived ? 'Mission 已归档' : 'Mission 已恢复', 'success');
-  render();
 }
 
 /* ----- Quick Run save card (used by chat stream) ----- */
@@ -2908,6 +2621,9 @@ function getAllMcpTools() {
   return out;
 }
 
+// HTML attr escape (避免引号问题)
+// escapeAttr 已在第155行定义：const escapeAttr = escapeHTML; 此处不再重复定义
+
 /* ===================== Modal: Save As Mission ===================== */
 function openModalSaveAsMission() {
   const root = $('#modal-save-as-mission');
@@ -3393,11 +3109,7 @@ async function loadSkills() {
     render();
   } catch (e) {
     console.warn('loadSkills failed', e);
-    // 静态预览或后端不可用时，优雅降级为本地可用数据，避免整个 Tools 页面不可用。
-    state.skills.market = [];
-    state.skills.mine = [];
-    state.skills.loaded = true;
-    render();
+    showToast && showToast('Skill 列表加载失败：' + (e.message || e));
   }
 }
 
@@ -3840,7 +3552,6 @@ function openAgentDetail(missionId, agentId, source="mine") {
 function cloneAgentForDraft(a) {
   ensureAgentSchema(a);
   return {
-    _agentRefId: a.id,
     name: a.name, role: a.role, icon: a.icon, model: a.model,
     kind: a.kind || 'agent',
     systemPrompt: a.systemPrompt || '',
@@ -3848,19 +3559,16 @@ function cloneAgentForDraft(a) {
     mcpTools: [...(a.mcpTools||[])],
     teamMemberIds: [...(a.teamMemberIds||[])],
     memoryConfig:    JSON.parse(JSON.stringify(a.memoryConfig    || {})),
-    planningConfig:  JSON.parse(JSON.stringify(a.planningConfig  || {})),
-    validationConfig: JSON.parse(JSON.stringify(a.validationConfig || {})),
-    hooks:           JSON.parse(JSON.stringify(a.hooks           || {})),
-    readme: a.readme || '',
+    planningConfig:  JSON.parse(JSON.stringify(a.planningConfig  || {}))
   };
 }
 
 function getCurrentAgent() {
-  if (!state.detail || state.detail.type !== 'agent') return null;
-  if (state.detail.source === 'market') {
+  if (!state.detail || state.detail.type !== "agent") return null;
+  if (state.detail.source === "market") {
     return (state.agentMarket || []).find(x => x.id === state.detail.agentId) || null;
   }
-  const m = state.missions.find(x => x.id === (state.detail.missionId || state.missionId));
+  const m = state.missions.find(x => x.id === state.detail.missionId);
   return m && m.squad.agents.find(x => x.id === state.detail.agentId);
 }
 
@@ -3904,16 +3612,22 @@ function markDetailDirty() {
     }
     const dot = document.getElementById('detail-dirty-dot');
     if (dot) dot.classList.remove('hidden');
-  }
-}
-
 function closeDetail() {
   if (state.detail && state.detail.dirty) {
-    if (!confirm('当前有未保存的改动，确认离开？')) return false;
+    if (!confirm("当前有未保存的改动，确认离开？")) return false;
   }
   const detailType = state.detail && state.detail.type;
   state.detail = null;
-  state.view = detailType === 'agent' ? 'agents' : 'skills';
+  state.view = detailType === "agent" ? "agents" : "skills";
+  if (state.view === "skills" && !state.skills.loaded) loadSkills();
+  render();
+  return true;
+}
+    if (!confirm('当前有未保存的改动，确认离开？')) return false;
+  }
+  const wasAgent = state.detail && state.detail.type === 'agent';
+  state.detail = null;
+  state.view = wasAgent ? 'agents' : 'skills';
   if (state.view === 'skills' && !state.skills.loaded) loadSkills();
   render();
   return true;
@@ -4195,7 +3909,7 @@ function renderAgentDetailNLPanel(a, draft, tab) {
     <div class="p-md border border-outline-variant rounded-xl bg-surface-container-lowest">
       <p class="font-label-md text-on-surface mb-1 flex items-center gap-1.5">
         <span class="material-symbols-outlined text-[16px] text-primary">auto_awesome</span>
-        修改这个 Agent
+        用自然语言修改 Agent
       </p>
       <p class="text-[11px] text-secondary mb-2 leading-relaxed">
         当前正在编辑 <b class="text-on-surface">${escapeHTML(draft.name)}</b>。输入一句话生成修改 Diff，确认后才会应用。${tab==='missions'?'<br/><span class="text-amber-700">本 Tab 不支持修改</span>':''}
@@ -7511,7 +7225,6 @@ function showToast(msg, type='info') {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  loadMissions();
   loadCustomSkills();
   render();
   bootstrapAuth();

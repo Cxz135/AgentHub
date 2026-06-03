@@ -1,4 +1,256 @@
+# ==============================================
+# AgentHub Project - .gitignore
+# 包含Python后端 + Node.js前端/server 的所有忽略规则
+# ==============================================
+
+
+# ==============================================
+# Python / FastAPI 后端相关
+# ==============================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytest_debug.log
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Database files
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+.pnpm-debug.log*
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+VE/
+vsenv/
+pyvenv.cfg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+
+# ==============================================
+# Node.js / Express 服务端相关 (组员的server目录)
+# ==============================================
 # Dependencies
+node_modules/
+
+# Build outputs
+build/
+dist/
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage directory used by tools like istanbul
+coverage/
+*.lcov
+
+# nyc test coverage
+.nyc_output
+
+# Dependency directories
+jspm_packages/
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Optional REPL history
+.node_repl_history
+
+# Yarn Integrity file
+.yarn-integrity
+
+# dotenv environment variables files
+.env.test
+.env.production
+.env.local
+
+# Next.js build output
+.next
+
+# Nuxt.js build / generate output
+.nuxt
+dist
+
+# Gatsby files
+.cache/
+# Comment in the public line in if your project uses Gatsby and not Next.js
+# https://nextjs.org/blog/next-9-1#public-directory-support
+# public
+
+# vuepress build output
+.vuepress/dist
+
+# vuepress v2.x temp and cache directory
+.temp
+.cache
+
+# Docusaurus cache and generated files
+.docusaurus
+
+# Serverless directories
+.serverless/
+
+# FuseBox cache
+.fusebox/
+
+# DynamoDB Local files
+.dynamodb/
+
+# TernJS port file
+.tern-port
+
+# Stores VSCode versions used for testing VSCode extensions
+.vscode-test
+
+# yarn v2
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+.pnp.*
+
+
+# ==============================================
+# 项目特定的数据库文件
+# ==============================================
+# SQLite数据库文件（组员的server/data.sqlite等）
+*/server/data.sqlite
+*/server/data.sqlite-shm
+*/server/data.sqlite-wal
+*/backend/*.db
+*/backend/*.sqlite
+
+
+# ==============================================
+# 操作系统生成的文件
+# ==============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+
+# ==============================================
+# 临时文件和备份
+# ==============================================
+*.tmp
+*.temp
+*.bak
+*.backup
+*.old
+*.orig
+*.rej
+
+# ==============================================
+# 本地配置文件
+# ==============================================
+config_local.py
+settings_local.py
+local_settings.py
+
+# ==============================================
+# 代理文件
+# ==============================================
+*proxy.txt
+*proxy.json
+
+# ==============================================
+# 密钥和证书
+# ==============================================
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*secret*.json
+*token*.json# Dependencies
 node_modules/
 
 # SQLite runtime files
