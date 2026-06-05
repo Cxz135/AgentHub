@@ -129,6 +129,30 @@
 
   .mission-card-shadow:hover { box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
   .hidden { display:none !important; }
+
+  /* 打字机光标动画 */
+  @keyframes blink-cursor {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+  .typing-cursor {
+    animation: blink-cursor 0.8s step-end infinite;
+    color: #a3380b;
+    font-weight: 300;
+    margin-left: 1px;
+  }
+
+  /* 打字机光标动画 */
+  @keyframes blink-cursor {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+  .typing-cursor {
+    animation: blink-cursor 0.8s step-end infinite;
+    color: #a3380b;
+    font-weight: 300;
+    margin-left: 1px;
+  }
 </style>
 </head>
 <body class="bg-background text-on-surface overflow-hidden">
@@ -154,6 +178,61 @@ const uid = (p='id') => p + '_' + Math.random().toString(36).slice(2,8);
 const now = () => new Date().toLocaleTimeString('zh-CN', { hour:'2-digit', minute:'2-digit' });
 const escapeHTML = (s='') => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const escapeAttr = escapeHTML;
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** 滚动聊天区到底部（解决每次render后滚动到顶部的问题） */
+function scrollChatToBottom() {
+  requestAnimationFrame(() => {
+    const el = document.getElementById('chat-stream');
+    if (el) el.scrollTop = el.scrollHeight;
+  });
+}
+
+/** 对最后一个 agent 消息气泡执行打字机动画 */
+let _typingLock = false;
+let _typingSkip = false;
+async function typewriteLastBubble(fullText, speed = 10) {
+  if (_typingLock) { _typingLock = false; await sleep(50); }
+  _typingLock = true;
+  _typingSkip = false;
+  const stream = document.getElementById('chat-stream');
+  if (!stream) { _typingLock = false; return; }
+  const bubbles = Array.from(stream.querySelectorAll('.flex.justify-start'));
+  const bubbleDiv = bubbles[bubbles.length - 1];
+  if (!bubbleDiv) { _typingLock = false; return; }
+  const textEl = bubbleDiv.querySelector('.bg-surface-container-lowest');
+  if (!textEl) { _typingLock = false; return; }
+
+  // 点击气泡可跳过打字动画
+  const skipHandler = () => { _typingSkip = true; };
+  bubbleDiv.addEventListener('click', skipHandler, { once: true });
+
+  const run = getRun();
+  const msg = run.conversation[run.conversation.length - 1];
+  if (!msg) { _typingLock = false; return; }
+
+  textEl.innerHTML = '';
+  let displayed = '';
+  
+  // 长文本(>500字)使用更快速度
+  const effectiveSpeed = fullText.length > 500 ? Math.max(2, speed / 2) : speed;
+  
+  for (let i = 0; i < fullText.length; i++) {
+    if (!_typingLock || _typingSkip) break;  // 允许取消动画或跳过
+    displayed += fullText[i];
+    msg.text = displayed;
+    textEl.innerHTML = formatMentions(displayed) + '<span class="typing-cursor">▌</span>';
+    scrollChatToBottom();
+    await sleep(effectiveSpeed);
+  }
+  msg.text = fullText;
+  textEl.innerHTML = formatMentions(fullText);
+  scrollChatToBottom();
+  _typingLock = false;
+  _typingSkip = false;
+  bubbleDiv.removeEventListener('click', skipHandler);
+}
 
 /* ===== builtin skills ===== */
 const BUILTIN_SKILLS = [];
@@ -6939,6 +7018,7 @@ function sendChat() {
 
   // 3) 默认：调用后端API处理请求
   render();
+  scrollChatToBottom();
   const m = getMission();
   const a = m.squad.agents[0];
   const targetAgent = a || { name:'orchestrator', icon:'hub', id:'orchestrator' };
@@ -6946,6 +7026,7 @@ function sendChat() {
   let waitReply = a ? '已收到。正在调用后端AI处理您的请求...' : '已收到。将交由 Orchestrator 处理...';
   run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: waitReply });
   render();
+  scrollChatToBottom();
   
   // 调用后端聊天接口
   (async () => {
@@ -6960,16 +7041,48 @@ function sendChat() {
       });
       
       if (response.ok && response.reply) {
-        // 移除等待消息，添加真正的回复
+        // 移除等待消息
         run.conversation.pop();
-        run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: response.reply });
+        render();
+        scrollChatToBottom();
+        
+        // 如果有中间消息（子Agent依次回复），逐个以打字机动画显示
+        if (response.intermediate_messages && response.intermediate_messages.length > 0) {
+          for (const imsg of response.intermediate_messages) {
+            const agentName = imsg.agent_id === 'orchestrator' ? 'Orchestrator' : imsg.agent_id;
+            const icon = imsg.agent_id === 'orchestrator' ? 'hub' : 'smart_toy';
+            run.conversation.push({
+              type: 'agent',
+              agent: agentName,
+              icon: icon,
+              time: now(),
+              text: ''
+            });
+            render();
+            scrollChatToBottom();
+            await typewriteLastBubble(imsg.content, 12);
+          }
+        }
+        
+        // 最后以打字机动画显示 orchestrator 的最终总结回复（速度略快）
+        run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: '' });
+        render();
+        scrollChatToBottom();
+        await typewriteLastBubble(response.reply, 8);
+      } else {
+        // API返回但无reply
+        run.conversation.pop();
+        run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: '抱歉，未收到有效回复。' });
+        render();
+        scrollChatToBottom();
       }
     } catch (error) {
       // API调用失败，显示错误信息
       run.conversation.pop();
       run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: '抱歉，调用后端API时出错了：' + error.message });
+      render();
+      scrollChatToBottom();
     }
-    render();
   })();
 }
 

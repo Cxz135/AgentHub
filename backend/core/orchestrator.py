@@ -266,16 +266,15 @@ class Orchestrator:
         latest_message = messages[-1]
         content = latest_message.get("content", "").strip()
         
-        # 📝 任务复杂度判断日志（验证点1：会不会简单任务也拆解）
+        # 📝 任务复杂度判断（使用 LLM 分类器代替关键词匹配）
         logger.info(f"[VERIFY] 对话ID: {conversation_id}，用户输入: {content[:100]}...")
-        word_count = len(content)
-        is_simple = word_count < 20 and not any(keyword in content for keyword in [
-            "写代码", "开发", "编程", "实现", "帮我看看", "检查代码", "查询", "搜索"
-        ])
-        if is_simple:
-            logger.info(f"[VERIFY] 任务判断：简单任务，无需拆解，直接进入普通聊天。字数: {word_count}")
+        complexity_level = await self._classify_complexity(content)
+        if complexity_level == "complex":
+            logger.info(f"[VERIFY] 任务判断：复杂任务，将启动动态规划调度。")
+        elif complexity_level == "moderate":
+            logger.info(f"[VERIFY] 任务判断：中等复杂度任务，将路由到专家 Agent。")
         else:
-            logger.info(f"[VERIFY] 任务判断：复杂/特殊任务，进入深度调度逻辑。字数: {word_count}")
+            logger.info(f"[VERIFY] 任务判断：简单任务，无需拆解，进入普通聊天。")
 
         # 在顶层管理 checkpointer 的生命周期
         checkpointer_ctx = AsyncSqliteSaver.from_conn_string("agenthub_memory.sqlite")
@@ -305,15 +304,16 @@ class Orchestrator:
             else:
                 logger.info(f"[VERIFY] 任务判断：匹配得分{max_score}未达阈值({WORKFLOW_TRIGGER_THRESHOLD})，进入深度调度逻辑")
 
-            # 3. 第三优先级：判断是否是需要动态规划的复杂任务
-            is_complex_task = any(keyword in content for keyword in [
-                "写代码", "开发", "编程", "实现", "构建", "创建",
-                "debug", "排查", "写一个", "开发一个", "帮我写",
-                "快速排序", "算法", "项目", "系统", "设计"
-            ])
-            if is_complex_task:
-                logger.info(f"[VERIFY] 工作流/技能选择：未匹配到固定工作流，启动动态规划处理复杂任务")
+            # 3. 第三优先级：LLM 复杂度路由
+            if complexity_level == "complex":
+                logger.info(f"[VERIFY] 工作流/技能选择：复杂任务，启动动态规划")
                 return await self._handle_plan_command(conversation_id, content, checkpointer)
+
+            if complexity_level == "moderate":
+                logger.info(f"[VERIFY] 工作流/技能选择：中等复杂度任务，路由到主 Agent 直接执行")
+                enhanced_content = f"用户有一个任务交给你，请认真完成，如果需要搜索或调用工具可以自行使用。\n\n任务：{content}"
+                moderate_messages = [{"role": "user", "content": enhanced_content}]
+                return await self._handle_default_chat(conversation_id, moderate_messages)
 
             # 4. 最后检查是否是LLM自己生成的Skill调用请求
             skill_call = self._parse_skill_call(content)
@@ -331,7 +331,14 @@ class Orchestrator:
                     final_content = str(final_response).strip()
                 return {"agent_id": "orchestrator", "content": final_content}
 
-            # 5. 默认行为：普通聊天
+            # 5. 检查是否是系统查询（关于orchestrator自身的能力、Agent列表、Skill列表等）
+            #    这类问题 orchestrator 应该自己回答，而不是路由到 LLM
+            system_reply = self._handle_system_query(content)
+            if system_reply:
+                logger.info(f"[VERIFY] 工作流/技能选择：系统查询，由 Orchestrator 自行回答")
+                return {"agent_id": "orchestrator", "content": system_reply}
+
+            # 6. 默认行为：普通聊天
             logger.info(f"[VERIFY] 工作流/技能选择：普通聊天，路由到默认对话Agent")
             return await self._handle_default_chat(conversation_id, messages)
 
@@ -454,7 +461,35 @@ class Orchestrator:
         if summary:
             # 📦 记忆压缩与选择性遗忘（验证点：后续是否被压缩、子任务是否选择性遗忘）
             await self._compress_and_forget(conversation_id, checkpointer, final_state, plan_data)
-            return {"agent_id": "orchestrator", "content": summary}
+
+            # 构建中间消息列表（前端按顺序显示：规划→各Agent输出→总结）
+            agent_outputs = final_state.get("agent_outputs", [])
+            intermediate_messages = []
+
+            # 1. 以 Orchestrator 身份发送规划公告
+            tasks = plan_data.get("tasks", [])
+            plan_lines = ["📋 **任务规划详情：**\n"]
+            for i, task in enumerate(tasks):
+                agent_id = getattr(task, "agent_id", "未知Agent")
+                desc = getattr(task, "description", getattr(task, "prompt", ""))[:100]
+                plan_lines.append(f"  {i+1}. @{agent_id}：{desc}")
+            intermediate_messages.append({
+                "agent_id": "orchestrator",
+                "content": "\n".join(plan_lines)
+            })
+
+            # 2. 依次追加每个 Agent 的输出
+            for ao in agent_outputs:
+                intermediate_messages.append({
+                    "agent_id": ao.get("agent_id", "agent"),
+                    "content": ao.get("content", "")
+                })
+
+            return {
+                "agent_id": "orchestrator",
+                "content": summary,
+                "intermediate_messages": intermediate_messages
+            }
         else:
             logger.error(f"规划工作流执行完毕，但最终状态中没有找到有效的总结。最终状态: {final_state}")
             return {"agent_id": "orchestrator", "content": "抱歉，我执行了计划，但无法生成最终的总结报告。"}
@@ -541,6 +576,158 @@ class Orchestrator:
             "content": "你好！我是一个 Agent 协调器。你可以通过 @agent_name 与我管理的 Agent 对话，或者直接问我问题。"
         }
 
+    def _handle_system_query(self, content: str) -> str | None:
+        """
+        检测用户是否在询问系统信息（Agent列表、Skill列表、Orchestrator自身能力等），
+        如果是，直接从 Orchestrator 的内部状态回答，不路由到 LLM。
+        返回回答字符串，如果不是系统查询则返回 None。
+        """
+        content_lower = content.lower().strip()
+
+        # ===== 检测是否是系统查询关键词 =====
+        query_agents = any(kw in content for kw in [
+            "有哪些agent", "什么agent", "agent列表", "所有agent",
+            "显示agent", "列举agent", "列出agent",
+            "可用agent", "agent可以用", "agent可用",
+            "几个agent", "有哪些助手", "什么助手", "有哪些智能体",
+            "agent有哪些", "agent都有",
+        ])
+        query_skills = any(kw in content for kw in [
+            "有哪些skill", "什么skill", "skill列表", "所有skill",
+            "显示skill", "列举skill", "列出skill",
+            "可用skill", "skill可以用", "skill可用",
+            "几个skill", "有哪些技能", "什么技能", "所有技能",
+            "技能列表", "技能有哪些", "skill有哪些",
+        ])
+        query_workflows = any(kw in content for kw in [
+            "有哪些工作流", "什么工作流", "工作流列表", "所有工作流",
+            "可用工作流", "工作流有哪些",
+        ])
+        query_capability = any(kw in content for kw in [
+            "你能做什么", "你的能力", "orchestrator能",
+            "orchestrator可以", "你会什么", "你有什么功能",
+            "你有什么能力", "orchestrator功能",
+        ])
+        query_about_self = any(kw in content_lower for kw in [
+            "你是谁", "你是什么", "你是做什么的",
+        ])
+
+        if not any([query_agents, query_skills, query_workflows, query_capability, query_about_self]):
+            return None
+
+        # ===== 构建回答 =====
+        lines = []
+
+        if query_about_self:
+            lines.append("我是 **Orchestrator**（协调器），是 AgentHub 的核心调度中枢。")
+            lines.append("")
+            lines.append("我的职责包括：")
+            lines.append("- 🤖 管理所有 Agent 的注册、调度与路由")
+            lines.append("- 🔧 加载并执行 Skill（技能模块）")
+            lines.append("- ⚡ 自动识别任务类型，匹配最优的工作流")
+            lines.append("- 🧩 复杂任务动态拆解、规划与并行执行")
+            lines.append("- 📌 支持 @AgentName 直接调用指定 Agent")
+            lines.append("")
+
+        if query_agents or query_capability:
+            lines.append(f"📋 **当前已注册 {len(self.agents)} 个 Agent：**")
+            for agent_id, agent in self.agents.items():
+                agent_name = getattr(agent, 'name', agent_id)
+                agent_type = agent.__class__.__name__
+                lines.append(f"  - **{agent_name}**（类型: {agent_type}）")
+            lines.append("")
+            lines.append("💡 输入框输入 @Agent名称 可直接调用对应 Agent。")
+            lines.append("")
+
+        if query_skills or query_capability:
+            all_skills = list(self.native_skills.keys()) + list(self.tool_skills.keys())
+            if all_skills:
+                lines.append(f"📋 **当前已加载 {len(all_skills)} 个 Skill：**")
+                for sk in all_skills:
+                    lines.append(f"  - {sk}")
+            else:
+                lines.append("📋 当前没有已加载的 Skill。")
+            lines.append("")
+
+        if query_workflows or query_capability:
+            wf_names = list(self.workflows.keys())
+            if wf_names:
+                lines.append(f"📋 **当前已注册 {len(wf_names)} 个工作流：**")
+                for wf_id, wf_info in self.workflows.items():
+                    lines.append(f"  - **{wf_id}**：{wf_info.get('description', wf_id)}")
+            else:
+                lines.append("📋 当前没有注册的工作流。")
+            lines.append("")
+
+        if query_capability:
+            lines.append("---")
+            lines.append("💬 如果有复杂任务，我会自动协调最合适的 Agent 来处理。直接告诉我你的需求即可。")
+
+        return "\n".join(lines)
+
+    async def _classify_complexity(self, user_message: str, history_summary: str = "") -> str:
+        """
+        使用 LLM 将用户请求分类为: simple / moderate / complex
+        返回字符串供路由使用。
+        """
+        prompt = f"""分析以下用户请求，结合对话历史摘要，判断任务的复杂度级别。
+
+用户请求：
+{user_message}
+
+对话历史摘要：{history_summary if history_summary else "无"}
+
+任务复杂度定义：
+- simple: 简单闲聊、常识问答、单步翻译、无需外部工具或深度推理。
+- moderate: 需要多步推理、工具调用、或中等长度的技术任务（如代码优化、写详细文档），但只需一个专家即可完成。
+- complex: 需要多个不同角色协作（如前后端开发+测试+文档）、任务可拆分成多个独立子任务，或需要严格的多阶段产出。
+
+请只返回一个单词：simple、moderate 或 complex。"""
+
+        messages = [{"role": "user", "content": prompt}]
+        try:
+            resp = await self.llm.invoke(messages)
+            content = resp.content.strip().lower() if hasattr(resp, 'content') else str(resp).strip().lower()
+            if content in ("simple", "moderate", "complex"):
+                return content
+        except Exception as e:
+            logger.warning(f"LLM 复杂度分类失败，降级为关键词规则: {e}")
+
+        return self._fallback_complexity_rule(user_message)
+
+    def _fallback_complexity_rule(self, user_message: str) -> str:
+        """
+        当 LLM 分类失败时的关键词降级逻辑。
+        """
+        content = user_message.lower().strip()
+
+        # 短问候直接判 simple
+        if len(content) < 15:
+            return "simple"
+
+        # 复杂协作类关键词
+        complex_keywords = [
+            "写代码", "开发", "编程", "实现", "构建", "创建",
+            "debug", "排查", "写一个", "开发一个", "帮我写",
+            "快速排序", "算法", "项目", "系统", "设计",
+            "架构", "重构", "整体方案", "方案设计",
+            "帮我设计", "帮我开发", "帮我实现",
+        ]
+        if any(kw in content for kw in complex_keywords):
+            return "complex"
+
+        # 中等长度 + 技术性关键词
+        moderate_keywords = [
+            "优化", "改进", "分析", "解释", "比较", "对比",
+            "搜索", "查询", "推荐", "评价", "审查", "检查代码",
+            "帮我看看", "总结", "概括", "翻译", "改写",
+        ]
+        if len(content) > 30 and any(kw in content for kw in moderate_keywords):
+            return "moderate"
+
+        # 默认判 simple
+        return "simple"
+
     def _build_planning_graph(self) -> StateGraph:
         from langgraph.graph import StateGraph, END
 
@@ -581,10 +768,12 @@ class Orchestrator:
         plan_data = state.get("plan_data", {})
         tasks = plan_data.get("tasks", [])
         step_results = {}
+        # 初始化 Agent 中间输出列表，用于前端展示依次回复
+        agent_outputs = state.get("agent_outputs", [])
         
         if not tasks:
             logger.warning("没有可执行的子任务")
-            return {**state, "step_results": step_results}
+            return {**state, "step_results": step_results, "agent_outputs": agent_outputs}
             
         # 分离有依赖的任务和可并行的独立任务
         parallel_tasks = []
@@ -608,8 +797,11 @@ class Orchestrator:
                 if not agent:
                     return {"step_id": task.step_id, "result": f"错误：找不到Agent {agent_id}"}
                 try:
+                    # 🔧 注入技能上下文，让Agent知道有web_search等工具可用
+                    skills_prompt = self.get_available_skills_prompt()
+                    full_prompt = f"{skills_prompt}\n=== 当前任务 ===\n{prompt}"
                     from backend.models.message import Message
-                    msg = Message(conversation_id=state.get("conversation_id"), agent_id="user", content=prompt)
+                    msg = Message(conversation_id=state.get("conversation_id"), agent_id="user", content=full_prompt)
                     # 使用asyncio.run处理异步方法，在线程池中独立执行
                     import asyncio
                     resp = asyncio.run(agent.process_message([msg]))
@@ -634,15 +826,18 @@ class Orchestrator:
                     current_workspace = state.get("shared_workspace", {})
                     current_workspace[f"task_{r['step_id']}_output"] = r["result"]
                     state["shared_workspace"] = current_workspace
+                # 从任务里获取agent_id（用于收集Agent输出和保存到数据库）
+                agent_id = getattr(task_info, "agent_id", "agent") if task_info else "agent"
+                # 收集 Agent 输出（用于前端展示依次回复）
+                agent_outputs.append({
+                    "agent_id": agent_id,
+                    "content": r["result"]
+                })
                 # 子任务完成后实时保存到数据库，前端轮询就能看到
                 conv_id = state.get("conversation_id")
                 if conv_id and self.db_session:
                     from backend.services.conversation_service import ConversationService
                     conv_service = ConversationService(self.db_session)
-                    # 从任务里获取agent_id，找不到就用默认的
-                    task_info = next((t for t in parallel_tasks if t.step_id == r["step_id"]), None)
-                    agent_id = getattr(task_info, "agent_id", "qwen-long") if task_info else "qwen-long"
-                    # 保存消息到数据库
                     conv_service.add_message_to_conversation(
                         conversation_id=int(conv_id),
                         agent_id=agent_id,
@@ -650,6 +845,11 @@ class Orchestrator:
                     )
                     logger.info(f"💾 子任务{r['step_id']}的消息已写入数据库，Agent: {agent_id}")
                 logger.info(f"📤 子任务{r['step_id']}完成，结果：{r['result'][:100]}...")
+            # 收集 Agent 输出（用于前端展示依次回复）
+            agent_outputs.append({
+                "agent_id": agent_id,
+                "content": r["result"]
+            })
                 
         # 再执行顺序任务（简化处理，真实场景可做拓扑排序）
         for task in sequential_tasks:
@@ -658,20 +858,6 @@ class Orchestrator:
             agent = self.get_agent(agent_id)
             if agent:
                 try:
-                    # 🔧 黑板机制：从shared_workspace注入上下文到prompt
-                    workspace = state.get("shared_workspace", {})
-                    workspace_context = "\n=== 之前任务的关键发现（黑板上下文） ===\n"
-                    if workspace:
-                        for key, value in workspace.items():
-                            # 只取前300字，避免prompt过长
-                            workspace_context += f"- {key}: {str(value)[:300]}...\n"
-                    else:
-                        workspace_context += "暂无前置任务的共享上下文\n"
-                    
-                    # 合并上下文和当前任务prompt
-                    full_prompt = f"{workspace_context}\n=== 当前任务 ===\n{prompt}"
-                    
-                    from backend.models.message import Message
                     # 🔧 黑板机制：从shared_workspace注入上下文到prompt
                     workspace = state.get("shared_workspace", {})
                     workspace_context = "\n=== 之前任务的关键发现（黑板上下文） ===\n"
@@ -731,7 +917,17 @@ class Orchestrator:
                             content=f"📝 顺序任务{task.step_id}完成：\n{resp.final_answer.content}"
                         )
                         logger.info(f"💾 顺序子任务{task.step_id}的消息已写入数据库，Agent: {getattr(task, 'agent_id', 'agent')}")
+                    # 收集 Agent 输出（用于前端展示依次回复）
+                    agent_outputs.append({
+                        "agent_id": agent_id,
+                        "content": resp.final_answer.content
+                    })
                     logger.info(f"📤 顺序子任务{task.step_id}完成，结果：{resp.final_answer.content[:100]}...")
+                    # 收集 Agent 输出（用于前端展示依次回复）
+                    agent_outputs.append({
+                        "agent_id": agent_id,
+                        "content": resp.final_answer.content
+                })
                 except Exception as e:
                     step_results[task.step_id] = f"执行失败: {str(e)}"
                     logger.error(f"❌ 顺序子任务{task.step_id}执行失败: {e}")
@@ -925,6 +1121,45 @@ class Orchestrator:
                 except Exception as e:
                     logger.error(f"加载工作流插件 '{module_name}' 失败: {e}", exc_info=True)
 
+    def _create_langchain_llm(self, agent: BaseAgent) -> Any:
+        """
+        为 Agent 创建 LangChain ChatModel，用于 ReAct 循环。
+        根据 Agent 使用的适配器类型（Tongyi / DeepSeek）选择合适的 LangChain 模型。
+        """
+        adapter_type = "tongyi"
+        model_name = "qwen-plus"
+
+        if isinstance(agent, CustomAgent) and hasattr(agent, 'llm_adapter'):
+            adapter = agent.llm_adapter
+            if isinstance(adapter, DeepSeekAdapter):
+                adapter_type = "deepseek"
+                model_name = getattr(adapter, 'model_name', 'deepseek-chat')
+            elif hasattr(adapter, 'model_name'):
+                model_name = adapter.model_name
+
+        try:
+            if adapter_type == "deepseek":
+                from langchain_openai import ChatOpenAI
+                api_key = os.environ.get("DEEPSEEK_API_KEY")
+                if not api_key:
+                    logger.warning("DEEPSEEK_API_KEY 未设置，无法为 DeepSeek 创建 ReAct LLM")
+                    return None
+                return ChatOpenAI(
+                    model=model_name,
+                    api_key=api_key,
+                    base_url="https://api.deepseek.com/v1",
+                    temperature=0.7,
+                )
+
+            from langchain_community.chat_models.tongyi import ChatTongyi
+            return ChatTongyi(
+                model=model_name,
+                temperature=0.7,
+            )
+        except ImportError as e:
+            logger.warning(f"创建 LangChain ChatModel 失败，请安装对应依赖: {e}")
+            return None
+
     def register_agent(self, agent: BaseAgent):
         """注册Agent到Orchestrator，自动绑定所有工具，支持ReAct循环"""
         # 兼容不同版本的LangChain，处理import路径问题
@@ -945,6 +1180,10 @@ class Orchestrator:
         from langchain_core.prompts import ChatPromptTemplate
         
         # 给agent创建ReAct执行器，绑定所有langchain_tools
+        # 如果agent没有.llm，尝试为工具型Agent（CustomAgent等）创建一个LangChain LLM
+        if not hasattr(agent, 'llm') and self.langchain_tools and hasattr(agent, 'llm_adapter'):
+            agent.llm = self._create_langchain_llm(agent)
+
         if hasattr(agent, 'llm') and self.langchain_tools:
             try:
                 # ReAct标准prompt模板

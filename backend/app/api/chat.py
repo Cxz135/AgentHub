@@ -68,6 +68,7 @@ async def simple_chat(
             all_messages = [{"role": "user", "content": chat_req.message}]
 
         reply_content = None
+        intermediate_messages = []
         if hasattr(orchestrator, 'get_chat_response'):
             temp_conv_id = conversation_id or 0
             response = await orchestrator.get_chat_response(
@@ -76,6 +77,9 @@ async def simple_chat(
             )
             if isinstance(response, dict) and "content" in response:
                 reply_content = response["content"]
+            # 检查是否包含中间消息（子Agent依次回复）
+            if isinstance(response, dict) and "intermediate_messages" in response:
+                intermediate_messages = response["intermediate_messages"]
 
         if reply_content is None:
             reply_content = f"你好！我收到了你的消息：'{chat_req.message}'。当前Agent: {chat_req.agent.get('name', '未知Agent') if chat_req.agent else '未指定Agent'}。"
@@ -90,7 +94,16 @@ async def simple_chat(
             )
             logger.info(f"[SIMPLE-CHAT] AI 回复已存入 conversation {conversation_id}")
 
-        return {"ok": True, "reply": reply_content}
+            # 如果有中间消息（子Agent依次回复），也存入数据库
+            for msg in intermediate_messages:
+                conv_service.add_message_to_conversation(
+                    conversation_id=conversation_id,
+                    agent_id=msg.get("agent_id", "agent"),
+                    content=msg.get("content", "")
+                )
+                logger.info(f"[SIMPLE-CHAT] 中间消息已存入数据库，Agent: {msg.get('agent_id', 'agent')}")
+
+        return {"ok": True, "reply": reply_content, "intermediate_messages": intermediate_messages}
 
     except Exception as e:
         logger.error(f"[SIMPLE-CHAT] 处理消息出错: {e}")
@@ -190,6 +203,17 @@ async def send_message(
         
     if isinstance(final_state, dict) and "content" in final_state and "agent_id" in final_state:
         logger.info("[CHAT API] 正在将 Agent 的回复存入数据库...")
+
+        # 先保存中间消息（子Agent依次回复），确保前端的消息顺序正确
+        if "intermediate_messages" in final_state:
+            for msg in final_state["intermediate_messages"]:
+                conv_service.add_message_to_conversation(
+                    conversation_id=conversation_id,
+                    agent_id=msg.get("agent_id", "agent"),
+                    content=msg.get("content", "")
+                )
+                logger.info(f"[CHAT API] 中间消息已存入数据库，Agent: {msg.get('agent_id', 'agent')}")
+
         agent_message = conv_service.add_message_to_conversation(
             conversation_id=conversation_id,
             agent_id=final_state["agent_id"],

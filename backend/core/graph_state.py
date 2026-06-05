@@ -41,3 +41,9 @@ class GraphState(TypedDict):
     plan_iteration: int
 
     shared_workspace: dict
+
+    # 收集每个子 Agent 的执行结果，供前端展示 Agent 依次回复
+    agent_outputs: List[Dict[str, str]]
+
+    # 收集每个子 Agent 的执行结果，供前端展示 Agent 依次回复
+    agent_outputs: List[Dict[str, str]]
