@@ -2,7 +2,7 @@ from abc import ABC, abstractmethod
 from typing import List, Dict, Any
 
 # 假设 Message 类的定义，实际项目中应从 models.message 导入
-# from backend.models.message import Message
+# from backends.models.message import Message
 
 class BaseLLM(ABC):
     """

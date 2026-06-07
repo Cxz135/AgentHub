@@ -5,23 +5,20 @@ from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
 from backend.agents.base_agent import BaseAgent
 from backend.core.agent_protocol import AgentResponse, FinalAnswer
+from backend.llm.backend import LLMBackend
 from backend.models.message import Message
 from backend.utils.logger import logger
 
 
-# 我们复用通义千问的能力来进行摘要
-import dashscope
-
-
 class SummarizerAgent(BaseAgent):
     """
-    一个内部 Agent，专门负责将对话历史进行摘要。
-    它不参与外部工具调用，只专注于文本总结。
+    内部摘要 Agent：将对话历史压缩为简洁摘要。
+    使用 LLMBackend 进行 LLM 调用。
     """
 
-    def __init__(self, model: Any):
+    def __init__(self, backend: LLMBackend):
         super().__init__("summarizer")
-        self.model = model
+        self.backend = backend
 
     async def process(self, messages: List[Message], context: Dict[str, Any] = None) -> Message:
         # 为满足抽象类要求提供的最小化实现
@@ -72,18 +69,12 @@ class SummarizerAgent(BaseAgent):
         # 2. 调用大模型生成摘要
         try:
             logger.info("调用 SummarizerAgent 生成对话摘要...")
-            # 使用注入的 model 对象进行调用
-            # 注意：我们自定义的 TongyiLLM 使用的是 async def invoke(...)
-            response = await self.model.invoke([
+            response = await self.backend.chat([
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": prompt}
             ])
-            
-            # TongyiLLM.invoke 直接返回字符串内容
             summary_content = response
             logger.info(f"成功生成摘要: {summary_content}")
-
-            # 摘要 Agent 的最终产出就是摘要本身
             return AgentResponse(final_answer=FinalAnswer(content=summary_content))
 
         except Exception as e:

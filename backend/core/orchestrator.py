@@ -22,7 +22,8 @@ from backend.agents.tongyi_adapter import TongyiAdapter
 from backend.core.agent_protocol import AgentResponse
 from backend.core.graph_state import GraphState
 from backend.models.message import Message
-from backend.llm.llm_provider import get_llm
+from backend.llm.backend import LLMBackend
+from backend.llm.backends import TongyiBackend, DeepSeekBackend
 from backend.workflows.base import BaseWorkflow
 
 from backend.utils.logger import logger
@@ -46,11 +47,11 @@ class Orchestrator:
     def __init__(self, db_session=None):
         self.agents: Dict[str, BaseAgent] = {}
         self.workflows: Dict[str, Dict] = {}  # 重构后的结构：每个工作流带graph、keywords、description
+        self.llm_backends: Dict[str, LLMBackend] = {}  # LLM 后端注册表
         self.adapters: Dict[str, type[BaseAgent]] = {
             "deepseek": DeepSeekAdapter,
             "tongyi": TongyiAdapter,
         }
-        self.llm = get_llm()
         self.max_iterations = 10
         self.max_retries = 2
         # 保存数据库会话，用于实时写入子Agent的消息
@@ -64,7 +65,9 @@ class Orchestrator:
         self.langchain_tools: List[Any] = []
 
         # 🎯 优化后的初始化顺序：先核心，后业务
-        # 1. 先加载所有Skill（工具类），这样注册Agent时 langchain_tools 已就绪
+        # 0. 先注册所有 LLM 后端（统一适配器层的基础）
+        self._setup_backends()
+        # 1. 再加载所有Skill（工具类），这样注册Agent时 langchain_tools 已就绪
         self._load_native_skills()
         self._register_builtin_tool_skills()
         # 2. 再注册所有核心Agent（此时已有工具，可以创建ReAct执行器）
@@ -77,6 +80,48 @@ class Orchestrator:
         # 5. 最后加载数据库里的自定义Agent
         self._load_custom_agents_from_db()
         logger.info("✅ Orchestrator 初始化完成，所有组件加载成功。")
+
+    def _setup_backends(self):
+        """
+        注册所有 LLM 后端（统一适配器层）。
+        每个后端封装一个 LLM 平台的 API 调用，提供统一的 chat / chat_stream 接口。
+        """
+        try:
+            tongyi = TongyiBackend(model="qwen-plus")
+            self.llm_backends["tongyi"] = tongyi
+            logger.info(f"LLM 后端 'tongyi' 已注册 (model={tongyi.model_name})")
+        except Exception as e:
+            logger.warning(f"注册 LLM 后端 'tongyi' 失败: {e}")
+
+        try:
+            deepseek = DeepSeekBackend(model="deepseek-chat")
+            self.llm_backends["deepseek"] = deepseek
+            logger.info(f"LLM 后端 'deepseek' 已注册 (model={deepseek.model_name})")
+        except Exception as e:
+            logger.warning(f"注册 LLM 后端 'deepseek' 失败: {e}")
+
+    def get_backend(self, name: str) -> LLMBackend:
+        """
+        按名称获取 LLM 后端。
+        如果找不到，返回默认后端（tongyi）；如果没有任何后端，抛出异常。
+        """
+        backend = self.llm_backends.get(name)
+        if backend is not None:
+            return backend
+        # 降级：尝试用默认后端
+        if "tongyi" in self.llm_backends:
+            logger.warning(f"后端 '{name}' 未找到，降级使用 'tongyi'")
+            return self.llm_backends["tongyi"]
+        # 没有任何后端可用
+        raise RuntimeError("没有可用的 LLM 后端，请检查配置")
+
+    @property
+    def llm(self) -> LLMBackend:
+        """
+        兼容旧代码：返回默认 LLM 后端（tongyi）。
+        新代码应直接使用 self.get_backend(name).chat()。
+        """
+        return self.get_backend("tongyi")
 
     def _load_native_skills(self):
         """加载skills目录下所有的能力类Skill（md文件），纯自然语言的能力描述，就是你要的用户自建Skill"""
@@ -170,7 +215,7 @@ class Orchestrator:
         if skill_name in self.native_skills:
             full_prompt = f"{self.native_skills[skill_name]}\n\n### 待处理输入\n{input_content}"
             logger.info(f"🔧 调用能力类Skill: {skill_name}")
-            return self.llm.invoke(full_prompt).content.strip()
+            return await self.get_backend("tongyi").chat([{"role": "user", "content": full_prompt}])
         # 找不到Skill
         return f"错误：Skill '{skill_name}' 不存在，可用工具类: {list(self.tool_skills.keys())}, 可用能力类: {list(self.native_skills.keys())}"
 
@@ -197,7 +242,7 @@ class Orchestrator:
         # 注册文件转换工具组的所有方法
         try:
             import importlib
-            file_converter = importlib.import_module('backend.utils.file_converter')
+            file_converter = importlib.import_module('backends.utils.file_converter')
             # 获取所有导出的函数
             converter_funcs = getattr(file_converter, '__all__', [])
             for func_name in converter_funcs:
@@ -208,7 +253,7 @@ class Orchestrator:
             pass
         try:
             import importlib
-            manage_agent = importlib.import_module('backend.utils.manage_agent')
+            manage_agent = importlib.import_module('backends.utils.manage_agent')
             manage_agent_funcs = getattr(manage_agent, '__all__', [])
             for func_name in manage_agent_funcs:
                 if hasattr(manage_agent, func_name):
@@ -341,9 +386,8 @@ class Orchestrator:
                 logger.info(f"[VERIFY] 工作流/技能选择：触发技能调用 '{skill_name}{'.'+method if method else ''}'")
                 skill_result = await self.call_skill(skill_name, method, input_content)
                 final_prompt = f"Skill调用结果：{skill_result}\n\n请把这个结果整理成自然语言回复用户。"
-                # 通义千问要求输入是消息列表格式
                 messages = [{"role": "user", "content": final_prompt}]
-                final_response = await self.llm.invoke(messages)
+                final_response = await self.get_backend("tongyi").chat(messages)
                 if isinstance(final_response, str):
                     final_content = final_response.strip()
                 else:
@@ -431,7 +475,7 @@ class Orchestrator:
 2. 如果用户要新建 Agent，收集足够信息后调用 `manage_agent.create_agent`。
 3. 如果用户要更新 Agent，调用 `manage_agent.update_agent`。
 4. 所有工具输入都必须是 JSON 对象。`conversation_id` 和 `current_user_id` 已由系统提供（见下方上下文），调用工具时**必须带上**这两个字段。
-5. JSON 字段可使用：`conversation_id`、`current_user_id`、`agent_id`、`target_name`、`name`、`description`、`system_prompt`、`llm_adapter`、`tools`、`icon`、`memory_config`、`planning_config`、`validation_config`。
+5. JSON 字段可使用：`conversation_id`、`current_user_id`、`agent_id`、`target_name`、`name`、`description`、`system_prompt`、`llm_backend`、`tools`、`icon`、`memory_config`、`planning_config`、`validation_config`。
 6. 嵌套配置字段示例（均为可选，未明说不要下发）：
    - memory_config:
      * {{ "strategy": "none" }}
@@ -447,7 +491,7 @@ class Orchestrator:
      * {{ "strategy": "llm_judge", "judge_prompt": "...", "max_retries": 1 }}
 7. **对于缺失的字段，使用合理的默认值，不要追问用户。** 例如：
    - `name` 默认使用用户描述的职能名（如“数据分析师”）
-   - `llm_adapter` 默认使用 `"tongyi"`（可选值只有 `"tongyi"` 和 `"deepseek"`）
+   - `llm_backend` 默认使用 `"tongyi"`（可选值: `" + ", ".join(self.llm_backends.keys()) + "`）
    - `tools` 默认使用 `[]`（空列表）
    - `description` 从用户描述中一句话概括
    只有当用户完全没有提供任何 agent 相关信息时，才简要说明需要什么。
@@ -687,10 +731,8 @@ class Orchestrator:
             logger.error(f"[VERIFY] 失败降级：工作流执行出错，触发降级逻辑: {str(e)}", exc_info=True)
             # 失败降级：直接调用LLM生成基础回答，避免完全失败
             fallback_prompt = f"用户的问题是：{task_content}\n\n由于复杂任务调度暂时出错，请直接用你现有的知识回答用户的问题。"
-            # llm.invoke本身就是协程函数，直接await即可
-            # 通义千问要求输入是消息列表格式
             messages = [{"role": "user", "content": fallback_prompt}]
-            fallback_response = await self.llm.invoke(messages)
+            fallback_response = await self.get_backend("tongyi").chat(messages)
             if isinstance(fallback_response, str):
                 fallback_content = fallback_response
             else:
@@ -762,11 +804,10 @@ class Orchestrator:
             final_state = await app.ainvoke(initial_state, config=config)
             logger.info(f"🎉 工作流 {workflow_id} 执行完成")
         except Exception as e:
-            logger.error(f"[VERIFY] 失败降级：工作流{workflow_id}执行出错，触发降级: {str(e)}", exc_info=True)
+            logger.error(f"[VERIFY] 失败降级：工作流{{workflow_id}}执行出错，触发降级: {str(e)}", exc_info=True)
             fallback_prompt = f"用户的问题是：{task_content}\n\n工作流执行遇到问题，请直接用你的知识回答用户。"
-            # 通义千问要求输入是消息列表格式
             messages = [{"role": "user", "content": fallback_prompt}]
-            fallback_response = await self.llm.invoke(messages)
+            fallback_response = await self.get_backend("tongyi").chat(messages)
             if isinstance(fallback_response, str):
                 fallback_content = fallback_response
             else:
@@ -781,9 +822,9 @@ class Orchestrator:
         return {"agent_id": "orchestrator", "content": summary}
 
     async def _llm_invoke_text(self, msgs: List[Dict[str, str]]) -> str:
-        """工具方法：直接用全局 self.llm 跑一轮，返回纯文本。供 memory.summary 与 llm_judge 使用。"""
+        """工具方法：直接用 LLMBackend 跑一轮，返回纯文本。供 memory.summary 与 llm_judge 使用。"""
         try:
-            resp = await self.llm.invoke(msgs)
+            resp = await self.get_backend("tongyi").chat(msgs)
             return resp.strip() if isinstance(resp, str) else str(resp).strip()
         except Exception as exc:
             logger.warning(f"_llm_invoke_text 失败: {exc}")
@@ -959,8 +1000,8 @@ class Orchestrator:
 
         messages = [{"role": "user", "content": prompt}]
         try:
-            resp = await self.llm.invoke(messages)
-            content = resp.content.strip().lower() if hasattr(resp, 'content') else str(resp).strip().lower()
+            resp = await self.get_backend("tongyi").chat(messages)
+            content = resp.strip().lower() if isinstance(resp, str) else str(resp).strip().lower()
             if content in ("simple", "moderate", "complex", "agent_management"):
                 return content
         except Exception as e:
@@ -1205,11 +1246,8 @@ class Orchestrator:
         # 构建所有步骤的结果文本
         results_text = "\n".join([f"步骤{sid}: {result}" for sid, result in step_results.items()])
         prompt = f"用户的原始请求是：{task_content}\n\n各子任务的执行结果：\n{results_text}\n\n请将这些结果整理成一份清晰、友好的总结报告回复用户。"
-        
-        # llm.invoke本身就是协程函数，直接await即可
-        # 通义千问要求输入是消息列表格式
         messages = [{"role": "user", "content": prompt}]
-        summary = await self.llm.invoke(messages)
+        summary = await self.get_backend("tongyi").chat(messages)
         if isinstance(summary, str):
             summary = summary.strip()
         else:
@@ -1253,9 +1291,8 @@ class Orchestrator:
             if summarizer:
                 history_text = "\n".join([f"{m.type}: {m.content[:100]}" for m in all_messages[-20:]])
                 prompt = f"请总结以下对话历史，保留核心信息，丢弃不重要的调试细节、小插曲：\n{history_text}"
-                # 通义千问要求输入是消息列表格式
                 messages_for_summary = [{"role": "user", "content": prompt}]
-                summary_resp = await self.llm.invoke(messages_for_summary)
+                summary_resp = await self.get_backend("tongyi").chat(messages_for_summary)
                 if isinstance(summary_resp, str):
                     summary = summary_resp
                 else:
@@ -1297,29 +1334,24 @@ class Orchestrator:
                     continue
 
                 llm_config = config.get("llm_config", {})
-                adapter_id = llm_config.get("adapter_id")
-                adapter_class = self.adapters.get(adapter_id)
+                adapter_id = llm_config.get("adapter_id", "tongyi")
+                backend = self.llm_backends.get(adapter_id)
 
-                if not adapter_class:
-                    logger.warning(f"跳过自定义 Agent '{agent_id}'，因为找不到对应的适配器 '{adapter_id}'。")
+                if not backend:
+                    logger.warning(f"跳过自定义 Agent '{agent_id}'，因为找不到后端 '{adapter_id}'。可用后端: {list(self.llm_backends.keys())}")
                     continue
 
                 try:
-                    # 1. 创建底层的 LLM 适配器实例
-                    # 我们需要为每个自定义 Agent 创建一个独立的适配器实例
-                    adapter_instance = adapter_class.from_config(agent_id=f"{agent_id}_adapter", config=llm_config)
-
-                    # 2. 创建并注册 CustomAgent，将适配器实例注入
                     system_prompt = config.get("system_prompt", "你是一个乐于助人的AI助手。")
                     agent_name = config.get("name", agent_id)
                     custom_agent = CustomAgent(
                         agent_id=agent_id,
                         system_prompt=system_prompt,
-                        llm_adapter=adapter_instance,
+                        llm_backend=backend,
                         name=agent_name
                     )
                     self.register_agent(custom_agent)
-                    logger.info(f"成功加载并注册自定义 Agent: '{agent_name}' ({agent_id}) (由 {adapter_id} 驱动)")
+                    logger.info(f"成功加载自定义 Agent: '{agent_name}' ({agent_id}) (后端: {adapter_id})")
 
                 except Exception as e:
                     logger.error(f"加载自定义 Agent '{agent_id}' 时出错: {e}", exc_info=True)
@@ -1330,23 +1362,24 @@ class Orchestrator:
             logger.error(f"加载 custom_agents.yaml 文件时发生未知错误: {e}", exc_info=True)
 
     def _setup_agents(self):
-        """初始化并注册所有 Agent。"""
-        self.register_agent(PlannerAgent(model=self.llm))
-        self.register_agent(SummarizerAgent(model=self.llm))
+        """初始化并注册所有 Agent。使用统一的 LLMBackend 体系。"""
+        default_backend = self.get_backend("tongyi")
+        self.register_agent(PlannerAgent(backend=default_backend))
+        self.register_agent(SummarizerAgent(backend=default_backend))
 
-        # 注册核心 Agent
-        # 这些是系统内置的、总会存在的 Agent
+        # 注册核心 Agent（旧 Adapter 包装为 CustomAgent 向下兼容）
+        # TODO: 后续逐步将聊天 Agent 也从 TongyiAdapter 迁移到 CustomAgent + LLMBackend
         try:
             tongyi_config = {"model": "qwen-plus"}
             self.register_agent(TongyiAdapter.from_config("tongyi", tongyi_config))
-            logger.info("核心 Agent 'tongyi' 已注册。")
+            logger.info("核心 Agent 'tongyi' 已注册（旧适配器模式，计划废弃）。")
         except Exception as e:
             logger.warning(f"无法注册核心 Agent 'tongyi': {e}")
 
         try:
             deepseek_config = {"model": "deepseek-coder"}
             self.register_agent(DeepSeekAdapter.from_config("deepseek", deepseek_config))
-            logger.info("核心 Agent 'deepseek' 已注册。")
+            logger.info("核心 Agent 'deepseek' 已注册（旧适配器模式，计划废弃）。")
         except Exception as e:
             logger.warning(f"无法注册核心 Agent 'deepseek': {e}")
 
@@ -1359,7 +1392,7 @@ class Orchestrator:
 
         for filename in os.listdir(workflows_dir):
             if filename.endswith('.py') and filename not in ['__init__.py', 'base.py']:
-                module_name = f"backend.workflows.{filename[:-3]}"
+                module_name = f"backends.workflows.{filename[:-3]}"
                 try:
                     module = importlib.import_module(module_name)
                     if hasattr(module, 'workflow') and isinstance(module.workflow, BaseWorkflow):
@@ -1383,28 +1416,29 @@ class Orchestrator:
     def _create_langchain_llm(self, agent: BaseAgent) -> Any:
         """
         为 Agent 创建 LangChain ChatModel，用于 ReAct 循环。
-        用直接 HTTP 调用的轻量封装，避免 langchain-openai / langchain-community 版本冲突。
+        从 llm_backends 注册表中获取 API 配置。
         """
-        adapter_type = "tongyi"
-        model_name = "qwen-plus"
-
-        if isinstance(agent, CustomAgent) and hasattr(agent, 'llm_adapter'):
-            adapter = agent.llm_adapter
-            if isinstance(adapter, DeepSeekAdapter):
-                adapter_type = "deepseek"
-                model_name = getattr(adapter, 'model_name', 'deepseek-chat')
-            elif hasattr(adapter, 'model_name'):
-                model_name = adapter.model_name
-        elif hasattr(agent, 'model_name'):
-            # 直接适配器类（如 TongyiAdapter、DeepSeekAdapter），agent本身就是适配器
-            model_name = agent.model_name
-            if isinstance(agent, DeepSeekAdapter):
-                adapter_type = "deepseek"
-
         from langchain_core.language_models.chat_models import BaseChatModel
         from langchain_core.messages import BaseMessage, AIMessage, HumanMessage
         from langchain_core.outputs import ChatGeneration, ChatResult
-        import requests
+        import requests, os
+
+        backend_name = "tongyi"
+        model_name = "qwen-plus"
+
+        # 检测 Agent 使用的后端
+        if isinstance(agent, CustomAgent) and hasattr(agent, 'backend'):
+            backend_name = agent.backend.provider
+            model_name = agent.backend.model_name
+        elif hasattr(agent, 'model_name'):
+            model_name = agent.model_name
+            if isinstance(agent, DeepSeekAdapter):
+                backend_name = "deepseek"
+
+        # 从后端注册表获取配置
+        backend = self.llm_backends.get(backend_name)
+        if backend:
+            model_name = backend.model_name
 
         class HttpChatModel(BaseChatModel):
             """轻量 LangChain ChatModel：直接 HTTP 调用 API，0 外部依赖冲突"""
@@ -1417,22 +1451,14 @@ class Orchestrator:
             def _llm_type(self) -> str:
                 return "http-chat-model"
 
-            def _generate(
-                self,
-                messages: list,
-                stop: list = None,
-                run_manager=None,
-                **kwargs,
-            ) -> ChatResult:
+            def _generate(self, messages: list, stop: list = None, run_manager=None, **kwargs) -> ChatResult:
+                role_map = {"human": "user", "ai": "assistant", "system": "system",
+                            "tool": "tool", "function": "function"}
                 api_messages = []
                 for m in messages:
-                    if isinstance(m, HumanMessage):
-                        api_messages.append({"role": "user", "content": m.content})
-                    elif isinstance(m, AIMessage):
-                        api_messages.append({"role": "assistant", "content": m.content})
-                    else:
-                        api_messages.append({"role": m.type, "content": str(m.content)})
-
+                    raw_role = getattr(m, 'type', 'user')
+                    role = role_map.get(raw_role, "user")
+                    api_messages.append({"role": role, "content": getattr(m, 'content', str(m))})
                 payload = {
                     "model": self.model_name,
                     "messages": api_messages,
@@ -1440,42 +1466,34 @@ class Orchestrator:
                 }
                 if stop:
                     payload["stop"] = stop
-
                 resp = requests.post(
                     self.base_url,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                    timeout=60,
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json=payload, timeout=60,
                 )
                 if resp.status_code != 200:
                     raise RuntimeError(f"API {resp.status_code}: {resp.text[:300]}")
-
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
-                message = AIMessage(content=content)
-                return ChatResult(generations=[ChatGeneration(message=message)])
+                return ChatResult(generations=[ChatGeneration(message=AIMessage(content=content))])
 
-        if adapter_type == "deepseek":
-            api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if backend_name == "deepseek":
+            api_key = getattr(backend, 'api_key', None) or os.environ.get("DEEPSEEK_API_KEY", "")
             if not api_key:
                 logger.warning("DEEPSEEK_API_KEY 未设置，无法为 DeepSeek 创建 ReAct LLM")
                 return None
             return HttpChatModel(
-                model_name=model_name,
-                api_key=api_key,
+                model_name=model_name, api_key=api_key,
                 base_url="https://api.deepseek.com/v1/chat/completions",
             )
 
-        api_key = os.environ.get("DASHSCOPE_API_KEY")
+        # 默认：Tongyi (DashScope)
+        api_key = getattr(backend, 'api_key', None) or os.environ.get("DASHSCOPE_API_KEY", "")
         if not api_key:
             logger.warning("DASHSCOPE_API_KEY 未设置，无法为 Tongyi 创建 ReAct LLM")
             return None
         return HttpChatModel(
-            model_name=model_name,
-            api_key=api_key,
+            model_name=model_name, api_key=api_key,
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
         )
 
@@ -1541,29 +1559,22 @@ Final Answer: 最终的答案
             logger.info(f"Agent '{agent.agent_id}' 已注册。")
 
     def register_custom_agent(self, db_agent):
-        """注册用户通过表单创建的自定义Agent，和从yaml加载的逻辑完全一致"""
-        adapter_class = self.adapters.get(db_agent.llm_adapter)
-        if not adapter_class:
-            raise ValueError(f"找不到LLM适配器: {db_agent.llm_adapter}")
-        # 创建适配器实例
-        adapter_instance = adapter_class.from_config(
-            agent_id=f"{db_agent.agent_id}_adapter",
-            config={}
-        )
-        # 创建CustomAgent并注册（传入显示名称，@ 查找时按名称匹配）
-        from backend.agents.custom_agent import CustomAgent
+        """注册用户通过表单创建的自定义Agent，使用统一 LLMBackend。"""
+        backend_name = getattr(db_agent, "llm_adapter", "tongyi")
+        backend = self.llm_backends.get(backend_name) or self.get_backend("tongyi")
+
         new_agent = CustomAgent(
             agent_id=db_agent.agent_id,
             system_prompt=db_agent.system_prompt,
-            llm_adapter=adapter_instance,
-            name=db_agent.name
+            llm_backend=backend,
+            name=getattr(db_agent, "name", db_agent.agent_id),
         )
-        # A 档：把 3 类配置挂到 Agent 实例上，供运行时 (_handle_default_chat / _handle_mention) 读取
+        # 挂载 3 类配置
         new_agent.memory_config = getattr(db_agent, "memory_config", None)
         new_agent.planning_config = getattr(db_agent, "planning_config", None)
         new_agent.validation_config = getattr(db_agent, "validation_config", None)
         self.register_agent(new_agent)
-        logger.info(f"✅ 成功注册自定义Agent: {db_agent.name} ({db_agent.agent_id})")
+        logger.info(f"✅ 成功注册自定义Agent: {new_agent.name} ({db_agent.agent_id})，后端: {backend.provider}")
 
     def _load_custom_agents_from_db(self):
         """从数据库加载所有用户创建的自定义Agent，服务重启后自动注册"""
@@ -1669,7 +1680,7 @@ Final Answer: 最终的答案
     """
         # 调用 LLM
         messages = [{"role": "user", "content": prompt}]
-        resp = await self.llm.invoke(messages)
+        resp = await self.get_backend("tongyi").chat(messages)
         if isinstance(resp, str):
             content = resp
         else:

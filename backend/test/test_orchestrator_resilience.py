@@ -73,7 +73,7 @@ def mock_llm():
 
 
 @pytest.fixture
-@patch('backend.core.orchestrator.AsyncSqliteSaver.from_conn_string')
+@patch('backends.core.orchestrator.AsyncSqliteSaver.from_conn_string')
 def orchestrator_fixture(mock_conn_string, mock_llm):
     """
     创建一个 Orchestrator 实例，并将基于数据库的 checkpointer

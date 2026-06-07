@@ -3701,7 +3701,7 @@ function backendAgentToDetailShape(raw) {
     teamMemberIds: [],
     versions: [],
     readme: '',
-    // A 档：3 类配置 backend→draft（snake_case + backend 枚举 → camelCase + 前端 id）
+    // A 档：3 类配置 backends→draft（snake_case + backends 枚举 → camelCase + 前端 id）
     memoryConfig: _beMemoryToFe(raw.memory_config),
     planningConfig: _bePlanningToFe(raw.planning_config),
     validationConfig: _beValidationToFe(raw.validation_config),
@@ -3719,7 +3719,7 @@ function detailDraftToBackendPayload(draft) {
     system_prompt: draft.systemPrompt || '',
     llm_adapter: draft.model || 'tongyi',
     tools: Array.isArray(draft.skills) ? draft.skills : [],
-    // A 档：draft→backend（前端 id → 后端枚举），B 档子类（kv/tree/human）会被转成 null 不下发
+    // A 档：draft→backends（前端 id → 后端枚举），B 档子类（kv/tree/human）会被转成 null 不下发
     memory_config: _feMemoryToBe(draft.memoryConfig),
     planning_config: _fePlanningToBe(draft.planningConfig),
     validation_config: _feValidationToBe(draft.validationConfig)
@@ -3957,7 +3957,7 @@ function renderAgentDetailPage() {
       </div>`;
   }
 
-  // A 档：backend Agent 详情页中 memory/planning/validation 3 个 Tab 已解锁可编辑
+  // A 档：backends Agent 详情页中 memory/planning/validation 3 个 Tab 已解锁可编辑
   // 三个字段在保存时通过 detailDraftToBackendPayload 一并 PUT 给后端，
   // 后端 normalize_*_config 校验后持久化。
   // hooks/team 两个 Tab 当前后端无字段支持，继续锁定。

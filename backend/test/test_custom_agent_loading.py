@@ -43,8 +43,8 @@ def mock_env_vars(monkeypatch):
 
 
 # 我们 patch `open` 的范围被精确限制在 orchestrator 模块，以避免对其他库造成副作用。
-@patch('backend.core.orchestrator.AsyncSqliteSaver.from_conn_string', return_value=MemorySaver())
-@patch('backend.core.orchestrator.open', new_callable=mock_open, read_data=MOCK_YAML_CONTENT)
+@patch('backends.core.orchestrator.AsyncSqliteSaver.from_conn_string', return_value=MemorySaver())
+@patch('backends.core.orchestrator.open', new_callable=mock_open, read_data=MOCK_YAML_CONTENT)
 def test_custom_agent_loading(mock_open_file, mock_sqlite_saver, mock_env_vars):
     """
     一个完整的集成测试，用于验证 Orchestrator 的自定义 Agent 加载逻辑。
