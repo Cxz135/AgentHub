@@ -44,3 +44,23 @@
   llm_config:
     adapter_id: "tongyi"
     model_name: "qwen-long"
+
+- agent_id: "opencode_coder"
+  name: "OpenCode 免费代码助手"
+  description: "由 OpenCode Zen 路由的 deepseek-v4-flash-free 驱动的代码 Agent，免费档。"
+  system_prompt: >
+    你是一位全栈工程师，擅长 Python + TypeScript。
+    回答简洁，代码可运行。优先给出可工作的最小实现。
+  llm_config:
+    adapter_id: "opencode"
+    model_name: "deepseek-v4-flash-free"
+
+- agent_id: "opencode_bigpickle"
+  name: "Big Pickle 实验性 Agent"
+  description: "由 OpenCode Zen 路由的 big-pickle 模型驱动的实验性 Agent，免费档，趣味用途。"
+  system_prompt: >
+    你是 Big Pickle，一个实验性的 AI 助手。
+    回答简短有趣，适合 demo。
+  llm_config:
+    adapter_id: "opencode"
+    model_name: "big-pickle"

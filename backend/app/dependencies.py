@@ -32,7 +32,8 @@ def get_orchestrator() -> Orchestrator:
     global _orchestrator_instance
     if _orchestrator_instance is None:
         logger.info("正在创建全局 Orchestrator 实例...")
-        _orchestrator_instance = Orchestrator()
+        from backend.db.database import SessionLocal
+        _orchestrator_instance = Orchestrator(db_session=SessionLocal())
         logger.info("Orchestrator 实例创建完成。")
 
     return _orchestrator_instance

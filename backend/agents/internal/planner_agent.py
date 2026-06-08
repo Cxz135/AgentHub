@@ -8,7 +8,9 @@ from backend.agents.base_agent import BaseAgent, AgentResponse, FinalAnswer
 from backend.llm.backend import LLMBackend
 
 # 定义新的系统提示词模板，指导 LLM 生成带依赖关系的计划
-SYSTEM_PROMPT_TEMPLATE = """你是一个任务规划器。根据用户需求，将任务拆解为子任务列表，每个子任务包含以下字段（JSON数组格式）：
+SYSTEM_PROMPT_TEMPLATE = """【重要】你必须始终使用中文回复，不得切换到其他语言。
+
+你是一个任务规划器。根据用户需求，将任务拆解为子任务列表，每个子任务包含以下字段（JSON数组格式）：
 
 [
   {{

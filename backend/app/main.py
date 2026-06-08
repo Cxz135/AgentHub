@@ -1,8 +1,12 @@
 # app/main.py
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 
-load_dotenv()
+# 自动往上搜索 .env 文件（不管从哪个目录启动都能找到）
+dotenv_path = find_dotenv(usecwd=True)
+load_dotenv(dotenv_path)
+if not dotenv_path:
+    print("⚠️ 未找到 .env 文件，API keys 可能未加载")
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -157,6 +161,17 @@ def create_app() -> FastAPI:
         if hasattr(route, 'path'):
             print(f"{route.path} -> {route.name}")
     print("======================\n")
+
+    # 静态托管前端（必须放最后，确保 API 路由优先级更高）
+    from fastapi.staticfiles import StaticFiles
+    import os
+    frontend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'AgentHub-my flicker'))
+    if os.path.isdir(frontend_dir):
+        try:
+            app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
+            print(f"✅ 前端静态文件已挂载: {frontend_dir}")
+        except Exception as e:
+            print(f"⚠️ 挂载前端失败（可忽略，不影响 API）: {e}")
     
     return app
 

@@ -33,7 +33,7 @@ class DeepSeekBackend(LLMBackend):
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(60.0, connect=10.0),
+                timeout=httpx.Timeout(120.0, connect=10.0),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
             )
         return self._client

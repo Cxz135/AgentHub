@@ -1,4 +1,13 @@
 <!DOCTYPE html>
+<!--
+  ⚠️ 后端统一说明 (2026-06-07 统一)
+  ───────────────────────────────────────────────────────────
+  本前端默认走 FastAPI 后端 (API_BASE = http://localhost:8000/api)。
+  同目录下 server/ 目录里的 Node.js Express 后端 (端口 3030) 已被废弃
+  （仅作为历史参考保留），请勿再启动，否则会出现数据不一致。
+  启动方式：cd backend && python -m uvicorn app.main:app --port 8000
+  ───────────────────────────────────────────────────────────
+-->
 <html class="light" lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -16,6 +25,25 @@
   }
 </script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script>
+  // 配置 marked：代码块用 hljs 高亮，支持 GFM（表格、删除线等）
+  if (typeof marked !== 'undefined') {
+    marked.setOptions({
+      highlight: function(code, lang) {
+        if (lang && hljs.getLanguage(lang)) {
+          try { return hljs.highlight(code, {language: lang}).value; } catch(e) {}
+        }
+        try { return hljs.highlightAuto(code).value; } catch(e) {}
+        return code;
+      },
+      breaks: true,      // GFM 换行符转为 <br>
+      gfm: true,
+    });
+  }
+</script>
 <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet">
 <script>
   tailwind.config = {
@@ -153,6 +181,92 @@
     font-weight: 300;
     margin-left: 1px;
   }
+
+  .thinking-pulse {
+    animation: thinking-pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes thinking-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.5; }
+  }
+
+  /* Markdown body styling for agent messages */
+  .markdown-body {
+    font-size: 0.875rem;
+    line-height: 1.6;
+    color: var(--on-surface, #1c1b1b);
+  }
+  .markdown-body h1, .markdown-body h2, .markdown-body h3,
+  .markdown-body h4, .markdown-body h5, .markdown-body h6 {
+    font-weight: 600;
+    margin: 0.75em 0 0.4em;
+    line-height: 1.3;
+    color: var(--on-surface, #1c1b1b);
+  }
+  .markdown-body h1 { font-size: 1.25rem; }
+  .markdown-body h2 { font-size: 1.1rem; }
+  .markdown-body h3 { font-size: 1rem; }
+  .markdown-body p { margin: 0.5em 0; }
+  .markdown-body ul, .markdown-body ol {
+    padding-left: 1.5em;
+    margin: 0.5em 0;
+  }
+  .markdown-body li { margin: 0.2em 0; }
+  .markdown-body blockquote {
+    border-left: 3px solid var(--primary, #a3380b);
+    margin: 0.5em 0;
+    padding: 0.25em 0.75em;
+    color: #636262;
+    background: rgba(163,56,11,0.05);
+    border-radius: 0 4px 4px 0;
+  }
+  .markdown-body code {
+    background: rgba(0,0,0,0.06);
+    padding: 0.1em 0.3em;
+    border-radius: 3px;
+    font-size: 0.85em;
+    font-family: 'Fira Code', 'Consolas', monospace;
+  }
+  .markdown-body pre {
+    background: #f6f8fa;
+    border-radius: 8px;
+    padding: 0.75em 1em;
+    overflow-x: auto;
+    margin: 0.5em 0;
+    border: 1px solid #e1e4e8;
+  }
+  .markdown-body pre code {
+    background: transparent;
+    padding: 0;
+    font-size: 0.8rem;
+    color: inherit;
+  }
+  .markdown-body table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 0.5em 0;
+    font-size: 0.85rem;
+  }
+  .markdown-body table th, .markdown-body table td {
+    border: 1px solid #e5e2e1;
+    padding: 0.3em 0.6em;
+    text-align: left;
+  }
+  .markdown-body table th { background: rgba(0,0,0,0.04); font-weight: 600; }
+  .markdown-body img {
+    max-width: 100%;
+    border-radius: 6px;
+    margin: 0.5em 0;
+  }
+  .markdown-body hr {
+    border: none;
+    border-top: 1px solid #e5e2e1;
+    margin: 0.75em 0;
+  }
+  .markdown-body a { color: #a3380b; text-decoration: none; }
+  .markdown-body a:hover { text-decoration: underline; }
+  .markdown-body strong { font-weight: 600; }
+  .markdown-body em { font-style: italic; }
 </style>
 </head>
 <body class="bg-background text-on-surface overflow-hidden">
@@ -759,6 +873,7 @@ function render() {
   else if (state.view === 'kbs')         canvas.innerHTML = renderKnowledgePage();
   else if (state.view === 'kb_detail')   canvas.innerHTML = renderKbDetailPage();
   else if (state.view === 'settings')  canvas.innerHTML = renderSettingsPage();
+  if (typeof hljs !== 'undefined') hljs.highlightAll();
 }
 
 /* ===================== Dashboard ===================== */
@@ -1085,6 +1200,51 @@ function renderBubble(msg, idx) {
         </div>
       </div>`;
   }
+  if (msg.type === 'artifact') {
+    const artIcon = msg.artType === 'html_preview' ? 'travel_explore' : msg.artType === 'diagram' ? 'account_tree' : 'code';
+    const artTitle = msg.title || 'Code';
+    const lang = (msg.title && msg.title !== 'Code') ? msg.title.toLowerCase() : 'plaintext';
+    if (msg.artType === 'html_preview') {
+      return `<div class="flex justify-center">
+        <div class="w-full max-w-[90%] bg-surface-container-lowest border border-outline-variant rounded-xl overflow-hidden">
+          <div class="flex items-center gap-2 px-md py-2 bg-surface-container border-b border-outline-variant">
+            <span class="material-symbols-outlined text-[16px] text-primary">${artIcon}</span>
+            <span class="text-label-md font-bold text-on-surface">${escapeHTML(artTitle)}</span>
+            <span class="text-label-sm text-secondary ml-auto">Preview</span>
+          </div>
+          <iframe srcdoc=${JSON.stringify(msg.content)} class="w-full h-[400px] border-0" sandbox="allow-scripts"></iframe>
+        </div>
+      </div>`;
+    }
+    // markdown 类型渲染为富文本预览（用 marked.js）
+    if (msg.artType === 'markdown') {
+      const html = (typeof marked !== 'undefined') ? marked.parse(msg.content || '') : escapeHTML(msg.content);
+      return `<div class="flex justify-center">
+        <div class="w-full max-w-[90%] bg-surface-container-lowest border border-outline-variant rounded-xl overflow-hidden">
+          <div class="flex items-center gap-2 px-md py-2 bg-surface-container border-b border-outline-variant">
+            <span class="material-symbols-outlined text-[16px] text-primary">description</span>
+            <span class="text-label-md font-bold text-on-surface">${escapeHTML(artTitle)}</span>
+            <button onclick="navigator.clipboard.writeText(${JSON.stringify(msg.content)})" class="ml-auto text-label-sm text-secondary hover:text-primary flex items-center gap-1" title="Copy">
+              <span class="material-symbols-outlined text-[14px]">content_copy</span>Copy
+            </button>
+          </div>
+          <div class="markdown-body px-md py-3 overflow-y-auto max-h-[500px]">${html}</div>
+        </div>
+      </div>`;
+    }
+    return `<div class="flex justify-center">
+      <div class="w-full max-w-[90%] bg-surface-container-lowest border border-outline-variant rounded-xl overflow-hidden">
+        <div class="flex items-center gap-2 px-md py-2 bg-surface-container border-b border-outline-variant">
+          <span class="material-symbols-outlined text-[16px] text-primary">${artIcon}</span>
+          <span class="text-label-md font-bold text-on-surface">${escapeHTML(artTitle)}</span>
+          <button onclick="navigator.clipboard.writeText(${JSON.stringify(msg.content)})" class="ml-auto text-label-sm text-secondary hover:text-primary flex items-center gap-1" title="Copy">
+            <span class="material-symbols-outlined text-[14px]">content_copy</span>Copy
+          </button>
+        </div>
+        <pre class="px-md py-2.5 text-body-sm font-mono whitespace-pre-wrap overflow-x-auto max-h-[400px] overflow-y-auto text-on-surface"><code class="language-${lang}">${escapeHTML(msg.content)}</code></pre>
+      </div>
+    </div>`;
+  }
   if (msg.type === 'diff-card') {
     return `<div class="flex justify-center">
       <div class="bg-primary-fixed/30 border border-primary/30 rounded-xl px-md py-2.5 text-label-md text-on-primary-fixed flex items-center gap-2 cursor-pointer hover:bg-primary-fixed/60"
@@ -1096,8 +1256,20 @@ function renderBubble(msg, idx) {
     </div>`;
   }
   // agent message
+  const thinkingClass = msg.thinking ? ' thinking-pulse' : '';
+  // 检测是否为 markdown 内容（包含标题/列表/代码围栏/引用/分隔线/图片等）
+  function isMarkdown(text) {
+    return /^#{1,6}\s|^\s*[-*]\s|^\s*\d+\.\s|^\s*>\s|^\s*[-*]{3,}$|^\s*```|!\[[^\]]*\]\([^)]+\)/m.test(text);
+  }
+  function renderAgentText(text) {
+    if (isMarkdown(text)) {
+      const html = marked.parse(text);
+      return `<div class="markdown-body">${html}</div>`;
+    }
+    return `<div class="whitespace-pre-wrap">${formatMentions(text)}</div>`;
+  }
   return `
-    <div class="flex justify-start">
+    <div class="flex justify-start${thinkingClass}">
       <div class="max-w-[82%]">
         <div class="flex items-center gap-2 mb-1">
           <div class="w-6 h-6 rounded-full bg-secondary-container flex items-center justify-center">
@@ -1106,7 +1278,7 @@ function renderBubble(msg, idx) {
           <span class="text-label-md font-bold text-on-surface">${escapeHTML(msg.agent || 'Agent')}</span>
           <span class="text-label-sm text-secondary">${escapeHTML(msg.time || now())}</span>
         </div>
-        <div class="bg-surface-container-lowest border border-outline-variant rounded-2xl rounded-tl-sm px-md py-2.5 text-body-md whitespace-pre-wrap text-on-surface">${formatMentions(msg.text)}</div>
+        <div class="bg-surface-container-lowest border border-outline-variant rounded-2xl rounded-tl-sm px-md py-2.5 text-body-md text-on-surface">${renderAgentText(msg.text || '')}</div>
         ${msg.tool ? `
           <details class="mt-1.5 bg-surface-container border border-outline-variant rounded-lg overflow-hidden text-label-md">
             <summary class="cursor-pointer flex items-center gap-2 px-3 py-2 hover:bg-surface-container-high">
@@ -7156,19 +7328,62 @@ function simulateGroupChat(text, mentioned) {
   const m = getMission();
   const names = mentioned.map(x => x.name).join(', ');
   let waitReply = `已收到，正在向 @${names} 发起请求...`;
-  run.conversation.push({ type:'agent', agent:'orchestrator', icon:'hub', time: now(), text: waitReply });
+  run.conversation.push({ type:'agent', agent:'orchestrator', icon:'hub', time: now(), text: waitReply, thinking: true });
   render();
   (async () => {
     try {
-      // 不传 agent，由后端 orchestrator 解析 @ 并路由
-      const response = await api('/chat', {
+      const resp = await fetch(API_BASE + '/chat/stream', {
         method: 'POST',
-        body: JSON.stringify({ message: text, mission: m })
+        headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + localStorage.getItem('agenthub_token') },
+        body: JSON.stringify({ message: text, conversation_id: parseInt((m.id||'').replace('mis_','')) || 0 })
       });
-      if (response.ok && response.reply) {
-        run.conversation.pop();
-        run.conversation.push({ type:'agent', agent:'orchestrator', icon:'hub', time: now(), text: response.reply });
-      }
+      let finalContent = '';
+      let finalIntermed = [];
+      let hadIntermed = false;
+      await readSSEStream(resp, {
+        user_message_saved(d) {},
+        thinking(d) {
+          // 查找或创建该 agent 的气泡
+          const agentId = d.agent_id || 'agent';
+          let bubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && m.thinking);
+          if (d.status === 'thinking') {
+            if (!bubble) {
+              bubble = { type:'agent', agent:agentId, icon:agentId==='orchestrator'?'hub':'smart_toy', time:now(), text:'思考中...', thinking: true };
+              run.conversation.push(bubble);
+            }
+          } else if (d.status === 'done' && bubble) {
+            bubble.thinking = false;
+            if (bubble.text === '思考中...') bubble.text = '';
+          }
+          render(); scrollChatToBottom();
+        },
+        intermediate(d) {
+          // 找到并清除 thinking 气泡（如果有）
+          const agentId = d.agent_id || 'agent';
+          const thinkBubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && m.thinking);
+          if (thinkBubble) { thinkBubble.thinking = false; }
+          run.conversation.push({ type:'agent', agent:d.agent_id, icon:d.agent_id==='orchestrator'?'hub':'smart_toy', time:now(), text:d.content });
+          render(); scrollChatToBottom();
+        },
+        token(d) { finalContent += d.content; },
+        artifact(d) {
+          run.conversation.push({
+            type:'artifact', agent:names,
+            icon:'code', time:now(),
+            artType:d.type, title:d.title || '产物', content:d.content
+          });
+          render(); scrollChatToBottom();
+        },
+        final(d) {
+          finalContent = d.content || finalContent;
+          finalIntermed = d.intermediate_messages || [];
+        },
+      });
+      // 删除等待消息
+      run.conversation.pop();
+      // 最终回复（intermediate 事件已在流式期间实时渲染，不再重复）
+      run.conversation.push({ type:'agent', agent:'orchestrator', icon:'hub', time:now(), text: finalContent || '已完成' });
+      render(); scrollChatToBottom();
     } catch (error) {
       run.conversation.pop();
       run.conversation.push({ type:'agent', agent:'orchestrator', icon:'hub', time: now(), text: '抱歉，调用后端处理 @ 请求时出错了：' + error.message });
@@ -7288,67 +7503,127 @@ function sendChat() {
   scrollChatToBottom();
   const m = getMission();
   const a = m.squad.agents[0];
-  const targetAgent = a || { name:'orchestrator', icon:'hub', id:'orchestrator' };
+  // 有指定 Agent 才传 agent_override，否则后端自动路由（避免注入假 @orchestrator）
+  const targetAgent = a || null;
   // 先显示收到消息的提示
   let waitReply = a ? '已收到。正在调用后端AI处理您的请求...' : '已收到。将交由 Orchestrator 处理...';
-  run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: waitReply });
+  run.conversation.push({ type:'agent', agent:a?.name||'Orchestrator', icon:a?.icon||'hub', time: now(), text: waitReply, thinking: true });
   render();
   scrollChatToBottom();
   
-  // 调用后端聊天接口
+  // 调用后端 SSE 流式聊天接口
   (async () => {
     try {
-      const response = await api('/chat', {
+      const mId = parseInt((m.id||'').replace('mis_','')) || 0;
+      const resp = await fetch(API_BASE + '/chat/stream', {
         method: 'POST',
-        body: JSON.stringify({
-          message: text,
-          agent: targetAgent,
-          mission: m
-        })
+        headers: { 'Content-Type':'application/json', 'Authorization':'Bearer '+localStorage.getItem('agenthub_token') },
+        body: JSON.stringify({ message: text, conversation_id: mId, agent: targetAgent })
       });
       
-      if (response.ok && response.reply) {
-        // 移除等待消息
-        run.conversation.pop();
-        render();
-        scrollChatToBottom();
-        
-        // 如果有中间消息（子Agent依次回复），逐个以打字机动画显示
-        if (response.intermediate_messages && response.intermediate_messages.length > 0) {
-          for (const imsg of response.intermediate_messages) {
-            const agentName = imsg.agent_id === 'orchestrator' ? 'Orchestrator' : imsg.agent_id;
-            const icon = imsg.agent_id === 'orchestrator' ? 'hub' : 'smart_toy';
-            run.conversation.push({
-              type: 'agent',
-              agent: agentName,
-              icon: icon,
-              time: now(),
-              text: ''
-            });
-            render();
-            scrollChatToBottom();
-            await typewriteLastBubble(imsg.content, 12);
+      // 状态变量
+      let bubbleCreated = false;
+      let finalContent = '';
+      let finalIntermed = [];
+      let hadIntermed = false;
+      
+      await readSSEStream(resp, {
+        // 服务器确认用户消息已保存
+        user_message_saved(d) {},
+        thinking(d) {
+          const agentId = d.agent_id || 'agent';
+          let bubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && m.thinking);
+          if (d.status === 'thinking') {
+            if (!bubble) {
+              bubble = { type:'agent', agent:agentId, icon:agentId==='orchestrator'?'hub':'smart_toy', time:now(), text:'思考中...', thinking: true };
+              run.conversation.push(bubble);
+            }
+          } else if (d.status === 'done' && bubble) {
+            bubble.thinking = false;
+            if (bubble.text === '思考中...') bubble.text = '';
           }
+          render(); scrollChatToBottom();
+        },
+        // 中间消息（群聊模式下其他 Agent 的输出）
+        intermediate(d) {
+          hadIntermed = true;
+          // 清除 thinking 状态
+          const agentId = d.agent_id || 'agent';
+          const thinkBubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && m.thinking);
+          if (thinkBubble) { thinkBubble.thinking = false; }
+          run.conversation.push({
+            type:'agent', agent:d.agent_id==='orchestrator'?'Orchestrator':d.agent_id,
+            icon:d.agent_id==='orchestrator'?'hub':'smart_toy',
+            time:now(), text:d.content
+          });
+          render(); scrollChatToBottom();
+        },
+        // 流式 token（打字机驱动力）
+        token(d) {
+          if (!bubbleCreated) {
+            // 移除等待消息，创建真正的回复气泡
+            run.conversation.pop();
+            run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time:now(), text:'' });
+            bubbleCreated = true;
+            render(); scrollChatToBottom();
+          }
+          finalContent += d.content;
+          const msg = run.conversation[run.conversation.length - 1];
+          if (msg) { msg.text = finalContent; }
+          const bubbles = document.querySelectorAll('#chat-stream .flex.justify-start');
+          if (bubbles.length) {
+            const textEl = bubbles[bubbles.length - 1].querySelector('.bg-surface-container-lowest');
+            if (textEl) {
+              textEl.innerHTML = formatMentions(finalContent) + '<span class="typing-cursor">▌</span>';
+              scrollChatToBottom();
+            }
+          }
+        },
+        artifact(d) {
+          run.conversation.push({
+            type:'artifact', agent:targetAgent.name,
+            icon:'code', time:now(),
+            artType:d.type, title:d.title || '产物', content:d.content
+          });
+          render(); scrollChatToBottom();
+        },
+        // final（保留最终内容）
+        final(d) {
+          finalContent = d.content || finalContent;
+          finalIntermed = d.intermediate_messages || [];
+        },
+      });
+      
+      // 如果流式期间未收到 intermediate 事件但 final 事件中有，降级渲染
+      if (!hadIntermed && finalIntermed.length) {
+        for (const imsg of finalIntermed) {
+          run.conversation.push({
+            type:'agent', agent:imsg.agent_id==='orchestrator'?'Orchestrator':imsg.agent_id,
+            icon:imsg.agent_id==='orchestrator'?'hub':'smart_toy',
+            time:now(), text:imsg.content
+          });
         }
-        
-        // 最后以打字机动画显示 orchestrator 的最终总结回复（速度略快）
-        run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: '' });
-        render();
-        scrollChatToBottom();
-        await typewriteLastBubble(response.reply, 8);
-      } else {
-        // API返回但无reply
+        render(); scrollChatToBottom();
+      }
+
+      if (!bubbleCreated) {
+        // 没有流式 token → 降级显示
         run.conversation.pop();
-        run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: '抱歉，未收到有效回复。' });
-        render();
-        scrollChatToBottom();
+        run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time:now(), text: finalContent || '已完成' });
+        render(); scrollChatToBottom();
+      } else {
+        // 移除 cursor
+        const bubbles = document.querySelectorAll('#chat-stream .flex.justify-start');
+        if (bubbles.length) {
+          const textEl = bubbles[bubbles.length - 1].querySelector('.bg-surface-container-lowest');
+          if (textEl) textEl.innerHTML = formatMentions(finalContent);
+        }
+        render(); scrollChatToBottom();
       }
     } catch (error) {
-      // API调用失败，显示错误信息
       run.conversation.pop();
-      run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time: now(), text: '抱歉，调用后端API时出错了：' + error.message });
-      render();
-      scrollChatToBottom();
+      run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time:now(), text:'抱歉，调用后端API时出错了：'+error.message });
+      render(); scrollChatToBottom();
     }
   })();
 }
@@ -7384,6 +7659,28 @@ function manualSaveQuickRun() {
 }
 
 /* ===================== 验收自检（控制台） ===================== */
+// ---- SSE 流式读取器 ----
+async function readSSEStream(response, handlers) {
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let currentEvent = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      const s = line.trim();
+      if (s.startsWith('event: ')) currentEvent = s.slice(7).trim();
+      else if (s.startsWith('data: ') && handlers[currentEvent]) {
+        try { await handlers[currentEvent](JSON.parse(s.slice(6))); } catch (e) { console.warn('SSE', e); }
+      }
+    }
+  }
+}
 /* ===================== Auth · 前后端集成 ===================== */
 const API_BASE = 'http://localhost:8000/api';
 

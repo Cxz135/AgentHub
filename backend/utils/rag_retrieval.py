@@ -32,6 +32,13 @@ def rag_retrieval(query: str, top_k: int = 5) -> List[Dict[str, Any]]:
             })
         from backend.utils.logger import logger
         logger.info(f"✅ RAG检索完成，query: {query[:30]}..., 找到{len(results)}条结果")
+        # 检测向量库是否为空（全局文档数为0），给 agent 明确提示
+        try:
+            total_docs = vs.vector_store._collection.count()
+            if total_docs == 0 and not results:
+                logger.warning(f"[RAG-EMPTY] 知识库中没有任何文档，返回空结果")
+        except Exception:
+            pass
         return results
     except Exception as e:
         from backend.utils.logger import logger

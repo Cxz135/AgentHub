@@ -1,12 +1,12 @@
 {
-  "name": "agenthub-server",
+  "name": "agenthub-server-DEPRECATED",
   "version": "1.0.0",
-  "description": "AgentHub backend - Express + SQLite + JWT auth",
+  "description": "⚠️ DEPRECATED: Old Express backend (port 3030). All real traffic now goes to FastAPI on port 8000. This package is kept only for historical reference. See ../../../backend/ for the active backend.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start:deprecated": "node server.js",
+    "dev:deprecated": "node server.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

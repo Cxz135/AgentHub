@@ -1,7 +1,19 @@
-// server.js — AgentHub Express API + 静态托管前端
+// server.js — ⚠️ 已废弃 / DEPRECATED ⚠️
+// ────────────────────────────────────────────────────────────────────
+// 旧版 Node.js 后端（端口 3030），仅做静态托管与历史 demo。
+// 当前项目统一使用 FastAPI（端口 8000）作为唯一后端：
+//   - 前端 API_BASE = 'http://localhost:8000/api'
+//   - LLM 调用 / Orchestrator / 统一适配器层都在 FastAPI
+//   - 数据源是 backend/agenthub.db（SQLAlchemy）
+//
+// 本文件保留仅为「历史参考 / 故障回滚」用途，不应在生产或 demo 中启动。
+// 如需运行此 server（仅供对照），请手动 `node server.js`，并自行评估数据一致性。
+//
+// 旧版本说明（不再维护）：
 //   - 端口 3030
-//   - 同时把上级目录（前端 index.html 所在）静态托管到 /
+//   - 把上级目录（前端 index.html 所在）静态托管到 /
 //   - JWT secret 硬编码（demo 用，生产请改环境变量）
+// ────────────────────────────────────────────────────────────────────
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');

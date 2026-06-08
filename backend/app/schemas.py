@@ -87,6 +87,27 @@ class ArtifactSchema(BaseModel):
     content: str
 
 
+class ChatStreamRequest(BaseModel):
+    """SSE 流式聊天请求"""
+    message: str
+    conversation_id: Optional[int] = None
+    agent: Optional[dict] = None  # {id, name, llm_adapter, model_name, system_prompt}
+
+
+class IntermediateMessage(BaseModel):
+    agent_id: str
+    content: str
+    type: Optional[str] = None  # "plan" / "output" / "summary"
+
+
+class StreamFinal(BaseModel):
+    message_id: int
+    agent_id: str
+    content: str
+    intermediate_messages: List[IntermediateMessage] = []
+    artifacts: List[ArtifactSchema] = []
+
+
 class AgentCapability(BaseModel):
     name: str
     description: str

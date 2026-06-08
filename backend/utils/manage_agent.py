@@ -19,7 +19,7 @@ __all__ = ["create_agent", "update_agent", "list_agents"]
 # 上下文变量：用于向工具函数注入调用者上下文（current_user_id、conversation_id）
 _caller_ctx = contextvars.ContextVar('manage_caller_ctx', default={})
 
-VALID_ADAPTERS = {"tongyi", "deepseek"}
+VALID_ADAPTERS = {"tongyi", "deepseek", "opencode"}
 
 
 def _extract_payload(input_content: str) -> dict:
