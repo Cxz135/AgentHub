@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from backend.app.dependencies import get_db
 from backend.models.custom_agent import CustomAgent as CustomAgentModel
@@ -136,3 +137,50 @@ async def delete_agent(agent_id: str, db: Session = Depends(get_db), current_use
     db.commit()
     logger.info(f"🗑️ 用户{current_user.id} 删除Agent {db_agent.name}")
     return {"success": True, "message": "Agent已成功删除"}
+
+
+IMPROVE_SYSTEM_PROMPT = (
+    "【重要】你必须始终使用中文回复，不得切换到其他语言。\n\n"
+    "你是一个 Agent 提示词优化专家。用户给了一段原始的 Agent 提示词，"
+    "你的任务是在保留原意的基础上，将其优化为更专业、更精确的版本。\n\n"
+    "优化原则：\n"
+    "1. 明确 Agent 的角色和身份——它是谁？做什么的？\n"
+    "2. 添加具体的约束条件和边界——不该做什么？\n"
+    "3. 说明输出格式和风格——应该如何回答？\n"
+    "4. 添加错误处理和兜底策略——出错了怎么办？\n"
+    "5. 补充追问引导——什么时候应该反问用户？\n\n"
+    "原始提示词：\n---\n{original_prompt}\n---\n\n"
+    "请直接输出优化后的提示词（不要解释你做了什么改动，直接给出结果）：\n---"
+)
+
+
+class ImprovePromptRequest(BaseModel):
+    prompt: str
+
+
+@router.post("/improve-prompt")
+async def improve_agent_prompt(
+    req: ImprovePromptRequest,
+    current_user: Optional[UserModel] = Depends(try_get_current_user),
+):
+    """
+    AI 帮改提示词：接收用户输入的原始提示词，AI 自动优化后返回。
+    用于 Agent 创建页面的"AI 优化"按钮。
+    """
+    prompt = req.prompt
+    if not prompt or len(prompt.strip()) < 10:
+        return {"improved_prompt": prompt, "note": "输入过短，无需优化"}
+
+    try:
+        backend = orchestrator.get_backend("tongyi")
+        full_prompt = IMPROVE_SYSTEM_PROMPT.format(original_prompt=prompt[:2000])
+        improved = await backend.chat([
+            {"role": "user", "content": full_prompt}
+        ])
+        if isinstance(improved, str) and improved.strip():
+            logger.info(f"[PROMPT-IMPROVE] 提示词已优化，长度: {len(prompt)} -> {len(improved)}")
+            return {"improved_prompt": improved.strip()}
+    except Exception as e:
+        logger.warning(f"[PROMPT-IMPROVE] 优化失败: {e}")
+
+    return {"improved_prompt": prompt, "note": "优化服务暂时不可用，已保留原提示词"}

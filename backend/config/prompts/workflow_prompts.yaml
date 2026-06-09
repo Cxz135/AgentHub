@@ -1,0 +1,50 @@
+workflow:
+  plan_evaluation:
+    description: "任务规划评估prompt"
+    prompt: |
+      原始任务：{task_content}
+
+      已完成子任务状况：
+      {tasks_summary}
+
+      当前黑板共享信息：{workspace}
+
+      请判断：
+      1. 是否所有子任务都已成功？如果未全部成功，是否有可以补救的步骤？
+      2. 是否需要重新规划剩余任务？如果需要，请给出新的子任务列表（JSON数组，格式同前）。
+      3. 如果任务已全部完成且满足要求，返回 "complete"。
+
+      请以JSON格式返回：
+      {{
+        "decision": "continue" | "replan" | "complete",
+        "new_tasks": [ ... ]  // 仅当 decision=replan 时提供
+      }}
+
+  memory_compression:
+    description: "记忆压缩prompt"
+    prompt: |
+      请总结以下对话历史，保留核心信息，丢弃不重要的调试细节、小插曲：
+      {history_text}
+
+  task_execution:
+    description: "子任务执行prompt"
+    prompt: |
+      {skills_prompt}
+      {runtime_context}
+      {workspace_context}
+      === 当前任务 ===
+      {prompt}
+
+  fallback:
+    description: "降级回复prompt - 当复杂任务执行出错时"
+    prompt: |
+      用户的问题是：{task_content}
+
+      由于复杂任务调度暂时出错，请直接用你现有的知识回答用户的问题。
+
+  workflow_error:
+    description: "工作流执行错误prompt"
+    prompt: |
+      用户的问题是：{task_content}
+
+      工作流执行遇到问题，请直接用你的知识回答用户。

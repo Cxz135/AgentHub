@@ -8,6 +8,7 @@ from backend.core.agent_protocol import AgentResponse, FinalAnswer
 from backend.llm.backend import LLMBackend
 from backend.models.message import Message
 from backend.utils.logger import logger
+from backend.config.prompts import get_prompt_loader
 
 
 class SummarizerAgent(BaseAgent):
@@ -19,6 +20,7 @@ class SummarizerAgent(BaseAgent):
     def __init__(self, backend: LLMBackend):
         super().__init__("summarizer")
         self.backend = backend
+        self.prompt_loader = get_prompt_loader()
 
     async def process(self, messages: List[Message], context: Dict[str, Any] = None) -> Message:
         # 为满足抽象类要求提供的最小化实现
@@ -50,22 +52,17 @@ class SummarizerAgent(BaseAgent):
                 logger.warning(f"SummarizerAgent 收到未知消息类型: {type(m)}，将忽略此消息。")
                 continue
             history_lines.append(f"{role}: {content}")
-        
+
         history_text = "\n".join(history_lines)
 
         # 如果 messages 列表只包含一个 HumanMessage，通常意味着它不是一个对话历史，
         # 而是直接传递过来的、需要处理的文本内容。在这种情况下，我们直接使用其内容。
         if len(messages) == 1 and isinstance(messages[0], HumanMessage):
+            system_prompt = self.prompt_loader.get('agent', 'summarizer_single_message')
             prompt = messages[0].content
-            system_prompt = "你是一个文本处理专家。请根据用户的要求处理以下文本。"
         else:
-            system_prompt = (
-                "【重要】你必须始终使用中文回复，不得切换到其他语言。"
-                "你是一个对话摘要专家。你的任务是阅读以下对话历史，并生成一段简洁、客观、包含关键信息的摘要。"
-                "摘要应该用第三人称视角来写，例如：'用户首先询问了...，助手回答了...'。"
-                "摘要的目的是为了让其他 Agent 能在不阅读完整历史的情况下，快速了解对话的核心内容。"
-            )
-            prompt = f"请对以下对话进行摘要：\n\n{history_text}"
+            system_prompt = self.prompt_loader.get('agent', 'summarizer_chat_history')
+            prompt = self.prompt_loader.get('agent', 'summarizer_prompt', history_text=history_text)
 
         # 2. 调用大模型生成摘要
         try:

@@ -136,7 +136,7 @@ def create_app() -> FastAPI:
     )
 
     # 导入路由
-    from backend.app.api import conversations, messages, agents, chat, auth, skills
+    from backend.app.api import conversations, messages, agents, chat, auth, skills, knowledge
 
     app.include_router(conversations.router, prefix="/api/missions", tags=["Missions"])
     app.include_router(messages.router, prefix="/api", tags=["Messages"])
@@ -145,6 +145,7 @@ def create_app() -> FastAPI:
     # 移除auth和skills的前缀，让接口路径与前端一致
     app.include_router(auth.router, prefix="/api", tags=["Authentication"])
     app.include_router(skills.router, prefix="/api/skills", tags=["Skills"])
+    app.include_router(knowledge.router, prefix="/api/knowledge", tags=["Knowledge"])
     
     # 添加健康检查端点以匹配组员的前端
     @app.get("/api/health")

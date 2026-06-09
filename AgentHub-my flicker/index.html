@@ -190,6 +190,37 @@
     50% { opacity: 0.5; }
   }
 
+  /* 追问气泡样式（Agent 反问机制） */
+  .clarification-box {
+    background: linear-gradient(135deg, #fff8e1 0%, #ffecb3 100%);
+    border: 1px solid #ffc107;
+    border-radius: 10px;
+    padding: 10px 14px;
+    margin-bottom: 8px;
+    font-size: 0.82rem;
+  }
+  .clarification-box::before {
+    content: '💬 请确认以下信息：';
+    display: block;
+    font-weight: 600;
+    color: #8a5a00;
+    margin-bottom: 6px;
+    font-size: 0.8rem;
+  }
+  .clarification-box ol {
+    margin: 0;
+    padding-left: 20px;
+    color: #6d4c00;
+  }
+  .clarification-box li {
+    margin-bottom: 4px;
+  }
+  .clarification-divider {
+    border: none;
+    border-top: 1px dashed #ffc107;
+    margin: 8px 0;
+  }
+
   /* Markdown body styling for agent messages */
   .markdown-body {
     font-size: 0.875rem;
@@ -1262,6 +1293,21 @@ function renderBubble(msg, idx) {
     return /^#{1,6}\s|^\s*[-*]\s|^\s*\d+\.\s|^\s*>\s|^\s*[-*]{3,}$|^\s*```|!\[[^\]]*\]\([^)]+\)/m.test(text);
   }
   function renderAgentText(text) {
+    // 检测反问内容：Agent 反问机制在回复前追加"为了给出更准确的答案，我需要确认..."
+    if (text.includes('为了给出更准确的答案，我需要确认')) {
+      const parts = text.split('**我的初步回答');
+      if (parts.length >= 2) {
+        const clarificationPart = parts[0].trim();
+        const answerPart = parts.slice(1).join('**我的初步回答').trim();
+        // 追问部分：提取编号列表
+        const clarificationHtml = `<div class="clarification-box">${formatMentions(clarificationPart)}</div>`;
+        // 分割线
+        const divider = '<hr class="clarification-divider"/>';
+        // 回答部分
+        const answerHtml = answerPart ? (isMarkdown(answerPart) ? `<div class="markdown-body">${marked.parse(answerPart)}</div>` : `<div class="whitespace-pre-wrap">${formatMentions(answerPart)}</div>`) : '';
+        return clarificationHtml + divider + answerHtml;
+      }
+    }
     if (isMarkdown(text)) {
       const html = marked.parse(text);
       return `<div class="markdown-body">${html}</div>`;
@@ -3094,7 +3140,9 @@ function openCreateAgentModal() {
             </div>
           </div>
           <div>
-            <label class="text-label-md text-secondary mb-1 block">System Prompt <span class="text-error">*</span></label>
+            <label class="text-label-md text-secondary mb-1 block">System Prompt <span class="text-error">*</span>
+              <button onclick="improveAgentPrompt('new-agent-prompt')" title="AI 自动优化提示词" class="ml-2 px-2 py-0.5 rounded border border-primary/40 text-primary text-[11px] hover:bg-primary-fixed/30 transition-colors font-medium">✨ AI 优化</button>
+            </label>
             <textarea id="new-agent-prompt" rows="4" placeholder="描述这个 Agent 的职责和行为..."
               class="w-full px-3 py-2 bg-surface-container-lowest border border-outline-variant rounded-lg text-body-md focus:outline-none focus:border-primary"></textarea>
           </div>
@@ -3122,7 +3170,7 @@ function openCreateAgentModal() {
 }
 
 async function submitCreateAgent() {
-  const name = ($('#new-agent-name')?.value || '').trim();
+  let name = ($('#new-agent-name')?.value || '').trim();
   const icon = state.newAgentIcon || 'smart_toy';
   const systemPrompt = ($('#new-agent-prompt')?.value || '').trim();
   const llmAdapter = $('#new-agent-llm')?.value || 'tongyi';
@@ -3132,11 +3180,92 @@ async function submitCreateAgent() {
   if (!name) { showToast('请输入 Agent 名称', 'error'); return; }
   if (!systemPrompt) { showToast('请输入 System Prompt', 'error'); return; }
 
+  // 自动解决重名：若已存在同名Agent，追加数字后缀
+  const allAgents = [...(state.customAgents || []), ...(state.missions || []).flatMap(m => m.squad?.agents || [])];
+  let baseName = name;
+  let counter = 2;
+  while (allAgents.some(a => a.name === name)) {
+    name = `${baseName} (${counter})`;
+    counter++;
+  }
+  if (name !== baseName) showToast(`检测到重名，已自动更名为"${name}"`, 'info');
+
   try {
     await createCustomAgentAPI(name, icon, systemPrompt, llmAdapter, tools);
     closeModal('modal-create-mission');
   } catch (e) {
     showToast('创建失败: ' + (e.message || e), 'error');
+  }
+}
+
+async function improveAgentPrompt(textareaId) {
+  const ta = document.getElementById(textareaId);
+  if (!ta) return;
+  const original = ta.value.trim();
+  if (!original || original.length < 10) {
+    showToast('请先输入一段提示词，再点击 AI 优化', 'error');
+    return;
+  }
+  const btn = ta.parentElement.querySelector('button[onclick*="improveAgentPrompt"]');
+  const origLabel = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = '优化中…'; btn.disabled = true; }
+
+  try {
+    const resp = await fetch(API_BASE + '/agents/improve-prompt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + localStorage.getItem('agenthub_token') },
+      body: JSON.stringify({ prompt: original }),
+    });
+    const data = await resp.json();
+    if (data.improved_prompt && data.improved_prompt !== original) {
+      ta.value = data.improved_prompt;
+      // 详情页需要手动同步 draft 状态并标记 dirty（textarea 是直接设值，不触发 oninput）
+      if (textareaId === 'detail-agent-prompt' && state.detail) {
+        state.detail.draft.systemPrompt = data.improved_prompt;
+        markDetailDirty();
+      }
+      showToast('提示词已优化，长度: ' + original.length + ' → ' + data.improved_prompt.length, 'success');
+    } else {
+      showToast(data.note || '未能优化，已保留原提示词', 'info');
+    }
+  } catch (e) {
+    showToast('优化失败: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.textContent = origLabel; btn.disabled = false; }
+  }
+}
+
+async function improveSkillPrompt() {
+  const ta = document.getElementById('skill-code-input');
+  if (!ta) return;
+  const original = ta.value.trim();
+  if (!original || original.length < 10) {
+    showToast('请先输入一段提示词，再点击 AI 优化', 'error');
+    return;
+  }
+  const modal = document.getElementById('modal-skill-edit');
+  const btn = modal ? modal.querySelector('button[onclick="improveSkillPrompt()"]') : null;
+  const origLabel = btn ? btn.textContent : '';
+  if (btn) { btn.textContent = '优化中…'; btn.disabled = true; }
+
+  try {
+    const resp = await fetch(API_BASE + '/agents/improve-prompt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + localStorage.getItem('agenthub_token') },
+      body: JSON.stringify({ prompt: original }),
+    });
+    const data = await resp.json();
+    if (data.improved_prompt && data.improved_prompt !== original) {
+      ta.value = data.improved_prompt;
+      state.skillEdit.code = data.improved_prompt;
+      showToast('提示词已优化，长度: ' + original.length + ' → ' + data.improved_prompt.length, 'success');
+    } else {
+      showToast(data.note || '未能优化，已保留原提示词', 'info');
+    }
+  } catch (e) {
+    showToast('优化失败: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.textContent = origLabel; btn.disabled = false; }
   }
 }
 
@@ -3646,8 +3775,10 @@ function renderSkillEditModal(root) {
               class="w-full px-3 py-2 bg-surface-container-lowest border border-outline-variant rounded-lg text-body-md focus:outline-none focus:border-primary"/>
           </div>
           <div>
-            <label class="block text-label-md text-secondary mb-1">实现说明 / Prompt 模板（可选，最长 4000 字）</label>
-            <textarea oninput="state.skillEdit.code=this.value" rows="6"
+            <label class="block text-label-md text-secondary mb-1">实现说明 / Prompt 模板（可选，最长 4000 字）
+              <button onclick="improveSkillPrompt()" title="AI 自动优化提示词" class="ml-2 px-2 py-0.5 rounded border border-primary/40 text-primary text-[11px] hover:bg-primary-fixed/30 transition-colors font-medium">✨ AI 优化</button>
+            </label>
+            <textarea id="skill-code-input" oninput="state.skillEdit.code=this.value" rows="6"
               placeholder="可粘贴 Prompt 模板、实现伪代码或调用步骤..."
               class="w-full px-3 py-2 bg-surface-container-lowest border border-outline-variant rounded-lg text-body-md font-mono text-[12px] focus:outline-none focus:border-primary">${escapeHTML(e.code||'')}</textarea>
           </div>
@@ -4070,10 +4201,12 @@ function renderAgentDetailPage() {
     body = `
       <div class="max-w-3xl">
         <div class="flex items-center justify-between mb-1">
-          <label class="text-label-md text-secondary">System Prompt</label>
+          <label class="text-label-md text-secondary">System Prompt
+            <button onclick="improveAgentPrompt('detail-agent-prompt')" title="AI 自动优化提示词" class="ml-2 px-2 py-0.5 rounded border border-primary/40 text-primary text-[11px] hover:bg-primary-fixed/30 transition-colors font-medium">✨ AI 优化</button>
+          </label>
           <button onclick="resetAgentPromptToOriginal()" class="text-[12px] text-secondary hover:text-primary">恢复服务器版本</button>
         </div>
-        <textarea rows="14" oninput="state.detail.draft.systemPrompt=this.value; markDetailDirty()"
+        <textarea id="detail-agent-prompt" rows="14" oninput="state.detail.draft.systemPrompt=this.value; markDetailDirty()"
           class="w-full px-3 py-2 bg-surface-container-lowest border border-outline-variant rounded-lg text-body-md font-mono text-[12px] focus:outline-none focus:border-primary"
           placeholder="你是一名...">${escapeHTML(draft.systemPrompt)}</textarea>
         <p class="text-[11px] text-secondary mt-1">该 Prompt 决定 Agent 的行为基调与边界。保存后会写入此 Mission 中该 Agent 的副本。</p>
@@ -6420,59 +6553,64 @@ async function onKbFilesPicked(ev) {
   if (!files.length) return;
   const u = state.kbUpload;
   for (const file of files) {
-    const item = { name: file.name, size: file.size, status: 'parsing', message: '解析中…' };
+    const item = { name: file.name, size: file.size, status: 'uploading', message: '上传中…' };
     u.items.push(item);
     renderKbUploadModal();
-    if (file.size > KB_MAX_FILE_SIZE) {
+    if (file.size > 10 * 1024 * 1024) {
       item.status = 'error';
-      item.message = `${(file.size/1024/1024).toFixed(2)}MB > 5MB 限制`;
-      showToast(`文件 "${file.name}" 大小 ${(file.size/1024/1024).toFixed(2)}MB，超过 5MB 限制无法上传`, 'error');
+      item.message = `${(file.size/1024/1024).toFixed(2)}MB > 10MB 限制`;
+      showToast(`文件 "${file.name}" 超过 10MB 限制`, 'error');
       renderKbUploadModal();
       continue;
     }
-    const parsed = await parseFileToText(file);
-    if (parsed.error) {
-      item.status = 'error';
-      item.message = parsed.error;
-      showToast(parsed.error, 'error');
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('knowledge_base', u.kbId || 'default');
+      item.status = 'uploading';
+      item.message = '上传并索引中…';
       renderKbUploadModal();
-      continue;
-    }
-    const chunks = chunkText(parsed.text);
-    if (!chunks.length) {
+      const resp = await fetch(API_BASE + '/knowledge/upload', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + localStorage.getItem('agenthub_token') },
+        body: formData,
+      });
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ detail: '上传失败' }));
+        throw new Error(err.detail || `HTTP ${resp.status}`);
+      }
+      const result = await resp.json();
+      // 将已上传的文件记录到 localStorage（保持前端一致性）
+      const kb = state.kbs.list.find(k => k.id === u.kbId);
+      if (kb) {
+        kb.docs = kb.docs || [];
+        kb.docs.push({
+          id: uidKb('doc'),
+          name: file.name,
+          mime: file.type,
+          size: file.size,
+          fileType: result.filename ? result.filename.split('.').pop() : 'unknown',
+          sourceType: 'file',
+          chunks: result.chunks ? Array(result.chunks).fill({}) : [],
+          status: 'ready',
+          uploadedAt: nowKbTs(),
+          backend_id: result.file_id,
+        });
+        kb.updatedAt = nowKbTs();
+        saveKbs();
+      }
+      item.status = 'ready';
+      item.chunks = result.chunks || 0;
+      item.message = `${result.chunks || '?'} chunks 已索引`;
+      showToast(`"${file.name}" 上传成功，${result.chunks} 个文本块已存入知识库`, 'success');
+    } catch (e) {
       item.status = 'error';
-      item.message = '内容为空，无可索引文本';
-      renderKbUploadModal();
-      continue;
+      item.message = e.message || '上传失败';
+      showToast('上传失败: ' + e.message, 'error');
     }
-    const kb = state.kbs.list.find(k => k.id === u.kbId);
-    if (!kb) { item.status='error'; item.message='知识库已不存在'; renderKbUploadModal(); continue; }
-    kb.docs.push({
-      id: uidKb('doc'),
-      name: file.name,
-      mime: parsed.mime || file.type,
-      size: file.size,
-      fileType: parsed.fileType,
-      sourceType: 'file',
-      rawText: parsed.text,
-      chunks,
-      status: 'ready',
-      uploadedAt: nowKbTs(),
-    });
-    kb.updatedAt = nowKbTs();
-    item.status = 'ready';
-    item.chunks = chunks.length;
-    item.message = `${chunks.length} chunks`;
-    try { saveKbs(); }
-    catch(e) { item.status='error'; item.message='保存失败：'+e.message; }
     renderKbUploadModal();
-    // 列表页也跟着刷
-    if (state.view === 'kb_detail') {
-      // 不强 render 整页 以免 modal 重建丢焦点（modal 已外置 dom）
-    }
+    if (state.view === 'kb_detail') render();
   }
-  // 全部完成后刷新底层详情页
-  if (state.view === 'kb_detail') render();
   renderKbUploadModal();
 }
 
@@ -7343,8 +7481,7 @@ function simulateGroupChat(text, mentioned) {
       await readSSEStream(resp, {
         user_message_saved(d) {},
         thinking(d) {
-          // 查找或创建该 agent 的气泡
-          const agentId = d.agent_id || 'agent';
+          const agentId = d.agent_id || 'orchestrator';
           let bubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && m.thinking);
           if (d.status === 'thinking') {
             if (!bubble) {
@@ -7352,20 +7489,34 @@ function simulateGroupChat(text, mentioned) {
               run.conversation.push(bubble);
             }
           } else if (d.status === 'done' && bubble) {
-            bubble.thinking = false;
-            if (bubble.text === '思考中...') bubble.text = '';
+            const idx = run.conversation.indexOf(bubble);
+            if (idx !== -1) run.conversation.splice(idx, 1);
           }
           render(); scrollChatToBottom();
         },
         intermediate(d) {
-          // 找到并清除 thinking 气泡（如果有）
           const agentId = d.agent_id || 'agent';
           const thinkBubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && m.thinking);
-          if (thinkBubble) { thinkBubble.thinking = false; }
-          run.conversation.push({ type:'agent', agent:d.agent_id, icon:d.agent_id==='orchestrator'?'hub':'smart_toy', time:now(), text:d.content });
+          if (thinkBubble) {
+            const idx = run.conversation.indexOf(thinkBubble);
+            if (idx !== -1) run.conversation.splice(idx, 1);
+          }
+          const existBubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && !m.thinking && m.text === d.content);
+          if (!existBubble) {
+            run.conversation.push({ type:'agent', agent:d.agent_id, icon:d.agent_id==='orchestrator'?'hub':'smart_toy', time:now(), text:d.content });
+          }
           render(); scrollChatToBottom();
         },
-        token(d) { finalContent += d.content; },
+        token(d) { 
+          finalContent += d.content;
+          let tokenBubble = run.conversation.find(m => m.type === 'agent' && m.agent === 'orchestrator' && m.isTokenStream);
+          if (!tokenBubble) {
+            tokenBubble = { type:'agent', agent:'orchestrator', icon:'hub', time:now(), text:'', isTokenStream: true };
+            run.conversation.push(tokenBubble);
+          }
+          tokenBubble.text = finalContent;
+          render(); scrollChatToBottom();
+        },
         artifact(d) {
           run.conversation.push({
             type:'artifact', agent:names,
@@ -7379,13 +7530,20 @@ function simulateGroupChat(text, mentioned) {
           finalIntermed = d.intermediate_messages || [];
         },
       });
-      // 删除等待消息
-      run.conversation.pop();
-      // 最终回复（intermediate 事件已在流式期间实时渲染，不再重复）
-      run.conversation.push({ type:'agent', agent:'orchestrator', icon:'hub', time:now(), text: finalContent || '已完成' });
+      // 清理 thinking 气泡和 token 流式气泡
+      const thinkIdx4 = run.conversation.findIndex(m => m.type === 'agent' && m.thinking);
+      if (thinkIdx4 !== -1) run.conversation.splice(thinkIdx4, 1);
+      const tokenIdx = run.conversation.findIndex(m => m.type === 'agent' && m.isTokenStream);
+      if (tokenIdx !== -1) run.conversation.splice(tokenIdx, 1);
+      // 最终回复（避免重复：如果最后一个 agent 气泡内容与 finalContent 相同则不添加）
+      const lastAgent = run.conversation.findLast(m => m.type === 'agent');
+      if (!lastAgent || lastAgent.text !== finalContent) {
+        run.conversation.push({ type:'agent', agent:'orchestrator', icon:'hub', time:now(), text: finalContent || '已完成' });
+      }
       render(); scrollChatToBottom();
     } catch (error) {
-      run.conversation.pop();
+      const thinkIdx5 = run.conversation.findIndex(m => m.type === 'agent' && m.thinking);
+      if (thinkIdx5 !== -1) run.conversation.splice(thinkIdx5, 1);
       run.conversation.push({ type:'agent', agent:'orchestrator', icon:'hub', time: now(), text: '抱歉，调用后端处理 @ 请求时出错了：' + error.message });
     }
     render();
@@ -7528,7 +7686,6 @@ function sendChat() {
       let hadIntermed = false;
       
       await readSSEStream(resp, {
-        // 服务器确认用户消息已保存
         user_message_saved(d) {},
         thinking(d) {
           const agentId = d.agent_id || 'agent';
@@ -7539,45 +7696,40 @@ function sendChat() {
               run.conversation.push(bubble);
             }
           } else if (d.status === 'done' && bubble) {
-            bubble.thinking = false;
-            if (bubble.text === '思考中...') bubble.text = '';
+            const idx = run.conversation.indexOf(bubble);
+            if (idx !== -1) run.conversation.splice(idx, 1);
           }
           render(); scrollChatToBottom();
         },
-        // 中间消息（群聊模式下其他 Agent 的输出）
         intermediate(d) {
           hadIntermed = true;
-          // 清除 thinking 状态
           const agentId = d.agent_id || 'agent';
           const thinkBubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && m.thinking);
-          if (thinkBubble) { thinkBubble.thinking = false; }
-          run.conversation.push({
-            type:'agent', agent:d.agent_id==='orchestrator'?'Orchestrator':d.agent_id,
-            icon:d.agent_id==='orchestrator'?'hub':'smart_toy',
-            time:now(), text:d.content
-          });
+          if (thinkBubble) {
+            const idx = run.conversation.indexOf(thinkBubble);
+            if (idx !== -1) run.conversation.splice(idx, 1);
+          }
+          const existBubble = run.conversation.find(m => m.type === 'agent' && m.agent === agentId && !m.thinking && m.text === d.content);
+          if (!existBubble) {
+            run.conversation.push({
+              type:'agent', agent:d.agent_id==='orchestrator'?'Orchestrator':d.agent_id,
+              icon:d.agent_id==='orchestrator'?'hub':'smart_toy',
+              time:now(), text:d.content
+            });
+          }
           render(); scrollChatToBottom();
         },
-        // 流式 token（打字机驱动力）
         token(d) {
-          if (!bubbleCreated) {
-            // 移除等待消息，创建真正的回复气泡
-            run.conversation.pop();
-            run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time:now(), text:'' });
-            bubbleCreated = true;
-            render(); scrollChatToBottom();
-          }
           finalContent += d.content;
-          const msg = run.conversation[run.conversation.length - 1];
-          if (msg) { msg.text = finalContent; }
-          const bubbles = document.querySelectorAll('#chat-stream .flex.justify-start');
-          if (bubbles.length) {
-            const textEl = bubbles[bubbles.length - 1].querySelector('.bg-surface-container-lowest');
-            if (textEl) {
-              textEl.innerHTML = formatMentions(finalContent) + '<span class="typing-cursor">▌</span>';
-              scrollChatToBottom();
-            }
+          let tokenBubble = run.conversation.find(m => m.type === 'agent' && m.agent === (targetAgent?.name || 'orchestrator') && m.isTokenStream);
+          if (!tokenBubble) {
+            const thinkIdx = run.conversation.findIndex(m => m.type === 'agent' && m.thinking);
+            if (thinkIdx !== -1) run.conversation.splice(thinkIdx, 1);
+            tokenBubble = { type:'agent', agent:targetAgent?.name||'orchestrator', icon:targetAgent?.icon||'hub', time:now(), text:'', isTokenStream: true };
+            run.conversation.push(tokenBubble);
           }
+          tokenBubble.text = finalContent;
+          render(); scrollChatToBottom();
         },
         artifact(d) {
           run.conversation.push({
@@ -7587,41 +7739,27 @@ function sendChat() {
           });
           render(); scrollChatToBottom();
         },
-        // final（保留最终内容）
         final(d) {
           finalContent = d.content || finalContent;
           finalIntermed = d.intermediate_messages || [];
         },
       });
       
-      // 如果流式期间未收到 intermediate 事件但 final 事件中有，降级渲染
-      if (!hadIntermed && finalIntermed.length) {
-        for (const imsg of finalIntermed) {
-          run.conversation.push({
-            type:'agent', agent:imsg.agent_id==='orchestrator'?'Orchestrator':imsg.agent_id,
-            icon:imsg.agent_id==='orchestrator'?'hub':'smart_toy',
-            time:now(), text:imsg.content
-          });
-        }
-        render(); scrollChatToBottom();
-      }
+      // 清理 thinking 气泡和 token 流式气泡
+      const thinkIdx2 = run.conversation.findIndex(m => m.type === 'agent' && m.thinking);
+      if (thinkIdx2 !== -1) run.conversation.splice(thinkIdx2, 1);
+      const tokenIdx = run.conversation.findIndex(m => m.type === 'agent' && m.isTokenStream);
+      if (tokenIdx !== -1) run.conversation.splice(tokenIdx, 1);
 
-      if (!bubbleCreated) {
-        // 没有流式 token → 降级显示
-        run.conversation.pop();
-        run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time:now(), text: finalContent || '已完成' });
-        render(); scrollChatToBottom();
-      } else {
-        // 移除 cursor
-        const bubbles = document.querySelectorAll('#chat-stream .flex.justify-start');
-        if (bubbles.length) {
-          const textEl = bubbles[bubbles.length - 1].querySelector('.bg-surface-container-lowest');
-          if (textEl) textEl.innerHTML = formatMentions(finalContent);
-        }
-        render(); scrollChatToBottom();
+      // 如果没有 intermediate 且没有 token，添加最终回复
+      const lastAgent = run.conversation.findLast(m => m.type === 'agent');
+      if (!lastAgent || lastAgent.text !== finalContent) {
+        run.conversation.push({ type:'agent', agent:targetAgent?.name||'orchestrator', icon:targetAgent?.icon||'hub', time:now(), text: finalContent || '已完成' });
       }
+      render(); scrollChatToBottom();
     } catch (error) {
-      run.conversation.pop();
+      const thinkIdx3 = run.conversation.findIndex(m => m.type === 'agent' && m.thinking);
+      if (thinkIdx3 !== -1) run.conversation.splice(thinkIdx3, 1);
       run.conversation.push({ type:'agent', agent:targetAgent.name, icon:targetAgent.icon, time:now(), text:'抱歉，调用后端API时出错了：'+error.message });
       render(); scrollChatToBottom();
     }
@@ -7812,7 +7950,9 @@ function renderEditCustomAgentModal() {
               class="w-full px-3 py-2 rounded-lg bg-surface-container border border-outline-variant text-on-surface text-body-md focus:outline-none focus:border-primary">
           </div>
           <div>
-            <label class="text-label-sm text-secondary block mb-1">系统提示词</label>
+            <label class="text-label-sm text-secondary block mb-1">系统提示词
+              <button onclick="improveAgentPrompt('edit-agent-prompt')" title="AI 自动优化提示词" class="ml-2 px-2 py-0.5 rounded border border-primary/40 text-primary text-[11px] hover:bg-primary-fixed/30 transition-colors font-medium">✨ AI 优化</button>
+            </label>
             <textarea id="edit-agent-prompt" rows="4"
               class="w-full px-3 py-2 rounded-lg bg-surface-container border border-outline-variant text-on-surface text-body-md focus:outline-none focus:border-primary">${sysPrompt}</textarea>
           </div>

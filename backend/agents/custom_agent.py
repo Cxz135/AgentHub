@@ -17,13 +17,15 @@ class CustomAgent(BaseAgent):
         system_prompt: str,
         llm_backend: LLMBackend,
         name: str = None,
+        validation_config: dict = None,
     ):
         super().__init__(agent_id)
         self.name = name or agent_id
         self.system_prompt = system_prompt
         self.backend = llm_backend
+        self.validation_config = validation_config or {}
         logger.info(
-            f"CustomAgent '{self.agent_id}' 已创建，后端: {self.backend.provider}/{self.backend.model_name}"
+            f"CustomAgent '{self.agent_id}' 已创建，后端: {self.backend.provider}/{self.backend.model_name}, validation_config={self.validation_config}"
         )
 
     async def process_message(

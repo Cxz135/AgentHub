@@ -23,12 +23,14 @@ from backend.core.agent_protocol import AgentResponse
 from backend.core.graph_state import GraphState
 from backend.models.message import Message
 from backend.llm.backend import LLMBackend
+from backend.core.response_checker import check_response_completeness
 from backend.llm.backends import TongyiBackend, DeepSeekBackend, OpenCodeBackend
 from backend.workflows.base import BaseWorkflow
 
 from backend.utils.logger import logger
 from backend.core.memory_strategy import apply_memory_strategy
 from backend.core.validation_strategy import apply_validation_strategy, get_max_retries
+from backend.config.prompts import get_prompt_loader
 
 # 一个简单的正则表达式，用于从消息内容中匹配 @agent_id
 MENTION_REGEX = r'@(\w+)'
@@ -64,6 +66,8 @@ class Orchestrator:
         self.tool_skills: Dict[str, Callable] = {}
         # 封装成LangChain Tool的工具列表，支持ReAct循环
         self.langchain_tools: List[Any] = []
+        # 提示词加载器
+        self.prompt_loader = get_prompt_loader()
 
         # 🎯 优化后的初始化顺序：先核心，后业务
         # 0. 先注册所有 LLM 后端（统一适配器层的基础）
@@ -443,11 +447,15 @@ class Orchestrator:
                 progressive_queue=progressive_queue,
             )
 
+        if complexity_level == "simple":
+            logger.info(f"[VERIFY] 工作流/技能选择：简单任务，Orchestrator 直接回复")
+            return await self._handle_simple_chat(content, messages, progressive_queue)
+
         if complexity_level == "moderate":
             logger.info(f"[VERIFY] 工作流/技能选择：中等复杂度任务，路由到主 Agent 直接执行")
             enhanced_content = f"用户有一个任务交给你，请认真完成，如果需要搜索或调用工具可以自行使用。\n\n任务：{content}"
             moderate_messages = [{"role": "user", "content": enhanced_content}]
-            return await self._handle_default_chat(conversation_id, moderate_messages)
+            return await self._handle_default_chat(conversation_id, moderate_messages, progressive_queue)
 
         # 5. Skill 调用请求
         skill_call = self._parse_skill_call(content)
@@ -472,7 +480,7 @@ class Orchestrator:
 
         # 7. 默认行为：普通聊天
         logger.info(f"[VERIFY] 工作流/技能选择：普通聊天，路由到默认对话Agent")
-        return await self._handle_default_chat(conversation_id, messages)
+        return await self._handle_default_chat(conversation_id, messages, progressive_queue)
 
     async def get_chat_stream(
         self,
@@ -523,6 +531,9 @@ class Orchestrator:
                     yield {"type": "token", "content": entry["token"]}
                 elif entry.get("type") == "thinking":
                     yield {"type": "thinking", "agent_id": entry.get("agent_id", "agent"), "status": entry.get("status", "thinking")}
+                elif entry.get("type") == "tool_output":
+                    # 工具调用结果不作为 intermediate 渲染，也不收集到 intermediate_messages
+                    pass
                 else:
                     intermediate_from_queue.append(entry)
                     yield {
@@ -559,6 +570,10 @@ class Orchestrator:
             if entry.get("type") == "token_event":
                 had_token_stream = True
                 yield {"type": "token", "content": entry["token"]}
+            elif entry.get("type") == "tool_output":
+                intermediate_from_queue.append(entry)
+            elif entry.get("type") == "thinking":
+                yield {"type": "thinking", "agent_id": entry.get("agent_id", "agent"), "status": entry.get("status", "thinking")}
             else:
                 intermediate_from_queue.append(entry)
                 yield {
@@ -610,7 +625,8 @@ class Orchestrator:
         agent: Any,
         prompt: str = None,
         messages: list = None,
-        conversation_id: str = None
+        conversation_id: str = None,
+        progressive_queue: asyncio.Queue = None
     ) -> str:
         """
         统一 Agent 调用入口。
@@ -622,6 +638,38 @@ class Orchestrator:
         from datetime import datetime
         import time as _time
 
+        def _extract_last_user_message(msgs, pmt):
+            """提取最后一条用户消息，用于响应完整性检查"""
+            if msgs:
+                for m in reversed(msgs):
+                    if isinstance(m, dict) and m.get('role') == 'user':
+                        return m.get('content', '')
+                    elif hasattr(m, 'role') and m.role == 'user' and hasattr(m, 'content'):
+                        return m.content
+            return pmt or ''
+
+        def _should_ask_for_clarification(a):
+            """检查 agent 是否开启了回答前检查配置"""
+            cfg = getattr(a, 'validation_config', None) or {}
+            return bool(cfg.get('ask_before_answer', False))
+
+        def _apply_completeness_check(output_text, user_q, target_agent):
+            """对回复运行完整性检查，必要时追加追问"""
+            should_check = _should_ask_for_clarification(target_agent)
+            if not should_check:
+                return output_text
+            backend = getattr(target_agent, 'backend', None) or getattr(target_agent, 'llm_backend', None)
+            if not backend:
+                return output_text
+            try:
+                check_result = asyncio.run(check_response_completeness(user_q, output_text, backend))
+                if check_result.get('needs_clarification') and check_result.get('questions'):
+                    from backend.core.response_checker import build_clarification_response
+                    return build_clarification_response(check_result['questions'], output_text)
+            except Exception:
+                pass
+            return output_text
+
         # 收集要尝试的 agent 列表
         agents_to_try = [agent]
         if agent.agent_id in self.AGENT_FALLBACK_CHAIN:
@@ -631,6 +679,7 @@ class Orchestrator:
                     agents_to_try.append(fallback_agent)
 
         last_error = None
+        user_last_msg = _extract_last_user_message(messages, prompt)
         for attempt_agent in agents_to_try:
             t_agent = _time.time()
             try:
@@ -652,19 +701,42 @@ class Orchestrator:
                     if prompt:
                         label = "主 Agent" if attempt_agent is agent else f"回退 Agent ({attempt_agent.agent_id})"
                         logger.info(f"🚀 统一调用 {label} {attempt_agent.agent_id} 的 ReAct 执行器")
+                        logger.info(f"📋 ReAct 可用工具列表: {[t.name for t in self.langchain_tools]}")
                         full_prompt = f"【重要】你必须始终使用中文回复，不得切换到其他语言。\n当前日期：{datetime.now().strftime('%Y年%m月%d日')}\n\n用户问题：{prompt}"
-                        raw_resp = await attempt_agent.executor.ainvoke({"input": full_prompt})
+                        logger.info(f"🔧 开始调用 executor.ainvoke，工具数: {len(self.langchain_tools)}, 工具名: {[t.name for t in self.langchain_tools]}")
+
+                        if progressive_queue is not None:
+                            progressive_queue.put_nowait({
+                                "type": "thinking",
+                                "agent_id": attempt_agent.agent_id,
+                                "status": "thinking"
+                            })
+
+                        try:
+                            raw_resp = await attempt_agent.executor.ainvoke({"input": full_prompt})
+                        except Exception as exec_err:
+                            logger.error(f"❌ executor.ainvoke 执行异常: {exec_err}")
+                            raise
+
+                        if progressive_queue is not None:
+                            progressive_queue.put_nowait({
+                                "type": "thinking",
+                                "agent_id": attempt_agent.agent_id,
+                                "status": "done"
+                            })
+
+                        logger.info(f"✅ executor.ainvoke 完成")
                         t_elapsed = _time.time() - t_agent
                         output = raw_resp.get('output', str(raw_resp)) if isinstance(raw_resp, dict) else str(raw_resp)
+                        logger.info(f"🔍 [ReAct输出] 类型: {type(raw_resp)}, keys: {list(raw_resp.keys()) if isinstance(raw_resp, dict) else 'N/A'}")
                         logger.info(f"[AGENT-RESULT] {attempt_agent.agent_id} ({t_elapsed:.1f}s) 输出前200字: {str(output)[:200]}")
-                        # 如果输出包含已知错误模式，触发回退而非返回错误内容
-                        # 注意："invalid or incomplete response" 和 "missing 'action:'" 是 LangChain 解析器注入的，
-                        # 不代表 model 输出错误，不应触发 fallback。保留 API 层面的真实错误信号。
+
                         err_signals = ["invalid api-key", "401", "authentication_error", "rate limit", "invalid response"]
                         if any(sig in str(output).lower() for sig in err_signals):
                             logger.warning(f"[AGENT-FALLBACK] {attempt_agent.agent_id} 输出了错误内容，触发回退: {str(output)[:100]}")
                             raise RuntimeError(f"Agent 输出了错误内容: {str(output)[:200]}")
-                        return output
+                        checked = _apply_completeness_check(output, user_last_msg, attempt_agent)
+                        return checked
             except Exception as e:
                 last_error = e
                 err_type = "主 Agent" if attempt_agent is agent else f"回退 Agent ({attempt_agent.agent_id})"
@@ -679,11 +751,14 @@ class Orchestrator:
 
         raw_resp = await agent.process_message(messages)
         if isinstance(raw_resp, str):
-            return raw_resp
+            checked = _apply_completeness_check(raw_resp, user_last_msg, agent)
+            return checked
         if hasattr(raw_resp, 'final_answer') and raw_resp.final_answer and hasattr(raw_resp.final_answer, 'content'):
-            return raw_resp.final_answer.content
+            checked = _apply_completeness_check(raw_resp.final_answer.content, user_last_msg, agent)
+            return checked
         if hasattr(raw_resp, 'content'):
-            return raw_resp.content
+            checked = _apply_completeness_check(raw_resp.content, user_last_msg, agent)
+            return checked
         return str(raw_resp)
 
     def _build_agent_management_prompt(self, user_request: str, conversation_id: str, messages: Optional[List[Dict[str, str]]] = None, request_context: Optional[Dict[str, Any]] = None) -> str:
@@ -1199,7 +1274,7 @@ class Orchestrator:
             logger.warning(f"_llm_invoke_text 失败: {exc}")
             return ""
 
-    async def _handle_default_chat(self, conversation_id: str, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+    async def _handle_default_chat(self, conversation_id: str, messages: List[Dict[str, str]], progressive_queue: asyncio.Queue = None) -> Dict[str, Any]:
         """处理不包含任何指令的普通聊天消息。
 
         A 档运行时三段式：
@@ -1224,15 +1299,10 @@ class Orchestrator:
             agent_context = "\n".join(agent_list) if agent_list else "暂无"
             skills_prompt = self.get_available_skills_prompt()
 
-            context_prompt = f"""你是 AgentHub 的人工智能助手，可以调用工具完成任务。
-
-【重要】你必须始终使用中文回复，不得切换到其他语言。无论用户使用何种语言提问，你都应以中文进行交流。
-
-当前系统中可用的 Agent：
-{agent_context}
-
-你可以自由使用以下工具(通过 Action: / Action Input: 格式)来完成用户交给你的任务：
-{', '.join(self.tool_skills.keys())}"""
+            context_prompt = self.prompt_loader.get('orchestrator', 'default_chat',
+                agent_context=agent_context,
+                tool_names=', '.join(self.tool_skills.keys())
+            )
 
             system_message = SystemMessage(content=context_prompt)
 
@@ -1249,16 +1319,28 @@ class Orchestrator:
                 prompt=f"{context_prompt}\n\n" + "\n".join(
                     f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages
                 ),
-                conversation_id=conversation_id
+                conversation_id=conversation_id,
+                progressive_queue=progressive_queue
             )
             return {"agent_id": main_chat_agent.agent_id, "content": output}
 
 
-        logger.warning("Chat API: 既没有匹配的指令，也找不到默认的主聊天 Agent。")
-        return {
-            "agent_id": "orchestrator",
-            "content": "你好！我是一个 Agent 协调器。你可以通过 @agent_name 与我管理的 Agent 对话，或者直接问我问题。"
-        }
+    async def _handle_simple_chat(self, content: str, messages: List[Dict], progressive_queue: asyncio.Queue = None) -> Dict[str, Any]:
+        """
+        处理简单聊天：Orchestrator 直接调用 LLM 回复，不经过 Agent。
+        用于简单闲聊、问候等不需要工具调用的场景。
+        不推送事件到 progressive_queue，由 get_chat_stream 统一处理流式输出。
+        """
+        prompt = self.prompt_loader.get('orchestrator', 'simple_chat', content=content)
+
+        try:
+            response = await self.get_backend("tongyi").chat([{"role": "user", "content": prompt}])
+            final_content = response.strip() if isinstance(response, str) else str(response).strip()
+        except Exception as e:
+            logger.error(f"[SIMPLE-CHAT] LLM 调用失败: {e}")
+            final_content = "你好！很高兴为你服务。请问有什么我可以帮你的？"
+
+        return {"agent_id": "orchestrator", "content": final_content}
 
     def _handle_system_query(self, content: str) -> str | None:
         """
@@ -1354,20 +1436,10 @@ class Orchestrator:
         使用 LLM 将用户请求分类为: agent_management / simple / moderate / complex
         返回字符串供路由使用。
         """
-        prompt = f"""分析以下用户请求，结合对话历史摘要，判断任务的复杂度级别。
-
-用户请求：
-{user_message}
-
-对话历史摘要：{history_summary if history_summary else "无"}
-
-任务复杂度定义：
-- agent_management: 用户在创建、修改、更新、删除或查询 Agent（智能体）的配置，例如「帮我创建一个数据分析师」「修改xxxAgent的提示词」「有哪些Agent可用」。
-- simple: 简单闲聊、常识问答、单步翻译、无需外部工具或深度推理。
-- moderate: 需要多步推理、工具调用、或中等长度的技术任务（如代码优化、写详细文档），但只需一个专家即可完成。
-- complex: 需要多个不同角色协作（如前后端开发+测试+文档）、任务可拆分成多个独立子任务，或需要严格的多阶段产出。
-
-请只返回一个单词：agent_management、simple、moderate 或 complex。"""
+        prompt = self.prompt_loader.get('orchestrator', 'complexity_classification',
+            user_message=user_message,
+            history_summary=history_summary if history_summary else "无"
+        )
 
         messages = [{"role": "user", "content": prompt}]
         try:
@@ -1851,7 +1923,7 @@ class Orchestrator:
             summarizer = self.get_agent("summarizer")
             if summarizer:
                 history_text = "\n".join([f"{m.type}: {m.content[:100]}" for m in all_messages[-20:]])
-                prompt = f"请总结以下对话历史，保留核心信息，丢弃不重要的调试细节、小插曲：\n{history_text}"
+                prompt = self.prompt_loader.get('workflow', 'memory_compression', history_text=history_text)
                 messages_for_summary = [{"role": "user", "content": prompt}]
                 summary_resp = await self.get_backend("tongyi").chat(messages_for_summary)
                 if isinstance(summary_resp, str):
@@ -2093,23 +2165,25 @@ class Orchestrator:
         )
 
     def register_agent(self, agent: BaseAgent):
-        """注册Agent到Orchestrator，自动绑定所有工具，支持ReAct循环"""
+        """注册Agent到Orchestrator，自动绑定所有工具，支持工具调用"""
         try:
             from langchain.agents.agent import AgentExecutor
             from langchain.agents import create_react_agent
         except ImportError:
-            logger.warning("⚠️ 未找到LangChain的ReAct相关模块，将跳过ReAct支持")
+            logger.warning("⚠️ 未找到LangChain的ReAct相关模块，将跳过工具调用支持")
             if agent.agent_id in self.agents:
                 logger.warning(f"Agent '{agent.agent_id}' 已被注册，将被覆盖。")
             self.agents[agent.agent_id] = agent
-            logger.info(f"✅ Agent '{agent.agent_id}' 已注册（无ReAct支持）。")
+            logger.info(f"✅ Agent '{agent.agent_id}' 已注册（无工具调用支持）。")
             return
         from langchain_core.prompts import ChatPromptTemplate
         
         # 给agent创建ReAct执行器，绑定所有langchain_tools
         # 统一尝试为 Agent 创建 LLM，不区分 CustomAgent/适配器类型
+        logger.info(f"🔍 [register_agent] agent={agent.agent_id}, has_llm={hasattr(agent,'llm')}, langchain_tools数量={len(self.langchain_tools)}, 工具名={[t.name for t in self.langchain_tools]}")
         if not hasattr(agent, 'llm') and self.langchain_tools:
             agent.llm = self._create_langchain_llm(agent)
+            logger.info(f"🔍 [register_agent] 为 agent 创建了 llm: {getattr(agent.llm, 'model_name', 'unknown')}")
 
         if hasattr(agent, 'llm') and self.langchain_tools:
             # deepseek-v4-flash 是 reasoning 模型，单次调用 70-110s，
@@ -2125,41 +2199,23 @@ class Orchestrator:
                 logger.info(f"Agent '{agent.agent_id}' 已注册（无 ReAct）。")
                 return
             try:
-                # ReAct prompt：更严格的格式要求，避免模型输出 Action Input 时出现 JSON dict 格式问题
-                # 注意：JSON 示例中的 {{}} 是 LangChain 模板转义，最终渲染为 {}
-                react_prompt = ChatPromptTemplate.from_template("""【重要】你必须始终使用中文回复，不得切换到其他语言。
-
-你是一个专家助手，可以调用工具来完成任务。
-
-可用工具：
-{tools}
-
-工具列表：{tool_names}
-
-你必须严格按以下格式输出，每一步占一行：
-
-Thought: 你需要做什么（一句话）
-Action: 工具名称（必须是上述列表中的工具）
-Action Input: 工具的输入参数（必须是字符串，如果是 JSON 对象请写成 JSON 字符串，例如 {{"query": "search term", "top_k": 3}}）
-Observation: 工具返回的结果
-...（重复 Thought/Action/Action Input/Observation 直到你有答案）
-Final Answer: 最终答案
-
-开始回答：
-问题：{input}
-{agent_scratchpad}""")
+                # ReAct agent 配置
+                from langchain_core.prompts import ChatPromptTemplate
+                react_prompt_template = self.prompt_loader.get('orchestrator', 'react_agent')
+                react_prompt = ChatPromptTemplate.from_template(react_prompt_template)
+                from langchain.agents import create_react_agent
                 react_agent = create_react_agent(agent.llm, self.langchain_tools, react_prompt)
                 agent_executor = AgentExecutor(
                     agent=react_agent,
                     tools=self.langchain_tools,
-                    verbose=True,
+                    verbose=False,
                     max_iterations=3,
-                    handle_parsing_errors="DEFAULT",
+                    handle_parsing_errors=True,
                 )
                 # 为agent附加执行器
                 agent.executor = agent_executor
                 self.agents[agent.agent_id] = agent
-                logger.info(f"✅ Agent '{agent.agent_id}' 已注册，绑定了{len(self.langchain_tools)}个工具，支持ReAct循环。")
+                logger.info(f"✅ Agent '{agent.agent_id}' 已注册，绑定了{len(self.langchain_tools)}个工具，支持工具调用。工具列表: {[t.name for t in self.langchain_tools]}")
             except Exception as e:
                 logger.warning(f"创建Agent {agent.agent_id}的ReAct执行器失败，降级为普通注册: {e}")
                 if agent.agent_id in self.agents:
@@ -2280,24 +2336,11 @@ Final Answer: 最终答案
                 f"结果摘要={result}"
             )
 
-        prompt = f"""原始任务：{task_content}
-
-    已完成子任务状况：
-    {chr(10).join(tasks_summary)}
-
-    当前黑板共享信息：{json.dumps(workspace, ensure_ascii=False)}
-
-    请判断：
-    1. 是否所有子任务都已成功？如果未全部成功，是否有可以补救的步骤？
-    2. 是否需要重新规划剩余任务？如果需要，请给出新的子任务列表（JSON数组，格式同前）。
-    3. 如果任务已全部完成且满足要求，返回 "complete"。
-
-    请以JSON格式返回：
-    {{
-      "decision": "continue" | "replan" | "complete",
-      "new_tasks": [ ... ]  // 仅当 decision=replan 时提供
-    }}
-    """
+        prompt = self.prompt_loader.get('workflow', 'plan_evaluation',
+            task_content=task_content,
+            tasks_summary=chr(10).join(tasks_summary),
+            workspace=json.dumps(workspace, ensure_ascii=False)
+        )
         # 调用 LLM
         messages = [{"role": "user", "content": prompt}]
         resp = await self.get_backend("tongyi").chat(messages)
