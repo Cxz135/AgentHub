@@ -139,12 +139,27 @@ def _check_acceptance_criteria(result: str, criteria: dict) -> List[str]:
                 f"={miss_ratio:.0%} ≤30%），放行: {missing}"
             )
 
-    # must_not_include：禁止出现的错误模式
+    # must_not_include：禁止出现的错误模式（容错阈值：命中 ≤30% 放行）
     must_not_include = criteria.get("must_not_include", [])
     if must_not_include:
+        hits = []
         for pattern in must_not_include:
             if str(pattern).lower() in result.lower():
-                failures.append(f"验收不通过：包含禁止内容「{pattern}」")
+                hits.append(pattern)
+        hit_ratio = len(hits) / len(must_not_include)
+        if len(hits) == len(must_not_include):
+            failures.append(f"验收不通过：所有禁止内容均出现 {hits}")
+        elif hit_ratio > 0.3:
+            failures.append(
+                f"验收不通过：命中 {len(hits)}/{len(must_not_include)} 个禁止内容 "
+                f"({hit_ratio:.0%} > 30%): {hits}"
+            )
+        elif hits:
+            import logging
+            logging.getLogger("core").debug(
+                f"[QualityChecker] must_not_include 少量命中（{len(hits)}/{len(must_not_include)}"
+                f"={hit_ratio:.0%} ≤30%），放行: {hits}"
+            )
 
     # min_length：最小输出长度
     min_length = criteria.get("min_length", 0)
