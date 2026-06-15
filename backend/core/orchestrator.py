@@ -1214,11 +1214,15 @@ class Orchestrator:
                     # 只追加本轮新增的
                     for ao in new_outputs[len(agent_outputs):]:
                         agent_outputs.append(ao)
-                        content_preview = str(ao.get('content', ''))[:100]
-                        logger.info(f"[PROGRESS] 子任务完成: agent={ao.get('agent_id')}, 长度={len(ao.get('content',''))}, 预览={content_preview}")
-                        # 推送到渐进式队列（如果有），get_chat_stream 会实时消费
+                        content = str(ao.get('content', ''))
+                        content_preview = content[:100]
+                        logger.info(f"[PROGRESS] 子任务完成: agent={ao.get('agent_id')}, 长度={len(content)}, 预览={content_preview}")
+                        # 推送到渐进式队列（过滤掉 Agent 截断/执行失败等无意义消息）
                         if progressive_queue is not None:
-                            progressive_queue.put_nowait(ao)
+                            if "Agent stopped due to" not in content and "执行失败" not in content:
+                                progressive_queue.put_nowait(ao)
+                            else:
+                                logger.info(f"[PROGRESS] 跳过前端推送（截断/失败消息）: {content_preview}")
             final_state = step_state
             logger.info(f"[VERIFY] 所有子任务执行完成，工作流成功结束")
         except Exception as e:
@@ -2613,6 +2617,15 @@ class Orchestrator:
             f"failed={len(failed_detail)}, discarded={len(discarded_ids)}"
         )
 
+        # 推送重规划进度到前端
+        prog_q = getattr(self, '_progressive_queue', None)
+        if prog_q is not None:
+            prog_q.put_nowait({
+                "agent_id": "orchestrator",
+                "content": f"🔄 正在重新规划...（保留 {len(valid_results)} 个已完成任务，重做 {len(failed_detail)} 个失败任务）",
+                "type": "output",
+            })
+
         # 3. 构建 replan prompt
         valid_summary = "\n".join(
             f"- 任务{sid}: {res[:150]}..." for sid, res in valid_results.items()
@@ -2733,6 +2746,15 @@ class Orchestrator:
         """
         task_content = state.get("task_content", "")
         logger.warning(f"[DEGRADE] 触发降级: {reason}")
+
+        # 推送降级通知到前端
+        prog_q = getattr(self, '_progressive_queue', None)
+        if prog_q is not None:
+            prog_q.put_nowait({
+                "agent_id": "orchestrator",
+                "content": f"⚠️ 复杂流程已降级处理：{reason}",
+                "type": "output",
+            })
 
         try:
             fallback_prompt = self.prompt_loader.get('workflow', 'fallback',
