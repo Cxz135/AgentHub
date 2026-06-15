@@ -37,8 +37,11 @@ def web_search(query: str) -> str:
         "messages": [{"role": "user", "content": query}],
         "edition": "standard",
         "search_source": "baidu_search_v2",
-        "search_recency_filter": "week"
     }
+    # 仅在查询明确要求最新信息时才加时效过滤
+    recency_keywords = ["最新", "今天", "今日", "本周", "最近", "latest", "today", "this week"]
+    if any(kw in query for kw in recency_keywords):
+        payload["search_recency_filter"] = "week"
 
     logger.info(f"[web_search] 请求 URL: https://qianfan.baidubce.com/v2/ai_search/web_search")
     logger.info(f"[web_search] 请求体: {json.dumps(payload, ensure_ascii=False)}")
