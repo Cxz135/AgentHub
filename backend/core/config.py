@@ -28,10 +28,10 @@ DEFAULT_MAX_RETRIES: int = 2
 Agent 验证失败后的最大重试次数。
 """
 
-REACT_MAX_ITERATIONS: int = 3
+REACT_MAX_ITERATIONS: int = 6
 """
 ReAct AgentExecutor 的最大迭代次数。
-注意：这个值比较小，因为每次迭代都涉及 LLM 调用。
+设为 6 以确保 web_search + 思考 + 最终输出有足够的轮次。
 """
 
 # ========== LLM 配置 ==========

@@ -54,6 +54,8 @@ _EXCEPTION_KEYWORDS = [
     r"作为AI.*无法",
     r"\[截断\]",
     r"\[truncated\]",
+    r"Agent stopped due to",
+    r"iteration limit or time limit",
 ]
 
 # 合并为一个编译后的正则

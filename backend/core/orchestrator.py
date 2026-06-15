@@ -1583,7 +1583,7 @@ class Orchestrator:
 
             skills_prompt = self.get_available_skills_prompt()
             runtime_context = f"=== 执行上下文 ===\n- conversation_id: {conversation_id}"
-            full_prompt = f"{skills_prompt}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}"
+            full_prompt = f"{skills_prompt}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}{self._format_acceptance_criteria(task)}"
 
             result_text, task_state, quality = await self._execute_single_task_with_retry(
                 task=task,
@@ -1719,7 +1719,7 @@ class Orchestrator:
                     if active_skills_list:
                         active_skills_injection = self.get_active_skills_injection(active_skills_list)
 
-                    full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}"
+                    full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}{self._format_acceptance_criteria(task)}"
 
                     # 使用重试+质量检查辅助方法
                     result_text, task_state, quality = await self._execute_single_task_with_retry(
@@ -1827,7 +1827,7 @@ class Orchestrator:
             if active_skills_list:
                 active_skills_injection = self.get_active_skills_injection(active_skills_list)
 
-            full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}"
+            full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}{self._format_acceptance_criteria(task)}"
 
             # 使用重试+质量检查辅助方法
             result_text, task_state, quality = await self._execute_single_task_with_retry(
@@ -1882,6 +1882,24 @@ class Orchestrator:
             "quality_reports": quality_reports,
             "orchestrator_state": OrchestratorState.RUNNING,
         }
+
+    @staticmethod
+    def _format_acceptance_criteria(task) -> str:
+        """将 TaskSpec 的验收标准格式化为醒目的提示文本，注入到 Agent prompt 中。"""
+        criteria = getattr(task, "acceptance_criteria", {}) or {}
+        if not criteria:
+            return ""
+        lines = ["", "=" * 40, "⚠️ 验收标准（必须满足，否则会被驳回重做）："]
+        if criteria.get("must_include"):
+            lines.append(f"  ✅ 必须包含: {', '.join(criteria['must_include'])}")
+        if criteria.get("must_not_include"):
+            lines.append(f"  ❌ 禁止出现: {', '.join(criteria['must_not_include'])}")
+        if criteria.get("min_length"):
+            lines.append(f"  📏 最小长度: {criteria['min_length']} 字符")
+        if criteria.get("format_rules"):
+            lines.append(f"  📐 格式要求: {', '.join(criteria['format_rules'])}")
+        lines.append("=" * 40)
+        return "\n".join(lines)
 
     async def _execute_single_task_with_retry(
         self, task, base_prompt: str, state: GraphState, conversation_id: str
