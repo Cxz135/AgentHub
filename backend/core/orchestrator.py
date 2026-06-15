@@ -738,6 +738,22 @@ class Orchestrator:
             t_agent = _time.time()
             try:
                 if hasattr(attempt_agent, 'executor'):
+                    # 智能判断：纯生成任务（代码/文档/大纲/路线图）不需要工具搜索
+                    # 检查 prompt 是否引用了任何工具名或 SKILL_CALL
+                    _tool_keywords = [t.name for t in self.langchain_tools] + [
+                        "SKILL_CALL", "web_search", "rag_retrieval",
+                        "scan_vulnerabilities", "file_converter",
+                    ]
+                    _needs_tools = any(
+                        kw.lower() in (prompt or "").lower() for kw in _tool_keywords
+                    )
+                    if not _needs_tools:
+                        logger.info(
+                            f"🎯 {attempt_agent.agent_id} 纯生成任务（prompt无工具引用），"
+                            f"跳过 ReAct 循环，直接调用 LLM"
+                        )
+                        raise AttributeError("skip_react")  # 触发 except → process_message 降级
+
                     if prompt is None and messages:
                         lines = []
                         for m in messages:
@@ -791,6 +807,10 @@ class Orchestrator:
                             raise RuntimeError(f"Agent 输出了错误内容: {str(output)[:200]}")
                         checked = _apply_completeness_check(output, user_last_msg, attempt_agent)
                         return checked
+            except AttributeError:
+                # skip_react: 纯生成任务，直接跳到 process_message
+                logger.info(f"🎯 跳过 ReAct，直接使用 process_message")
+                break
             except Exception as e:
                 last_error = e
                 err_type = "主 Agent" if attempt_agent is agent else f"回退 Agent ({attempt_agent.agent_id})"
