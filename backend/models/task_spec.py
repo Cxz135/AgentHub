@@ -11,6 +11,10 @@ class TaskSpec(BaseModel):
     max_retries: int = 1
     dependencies: list[str] = []     # 前置步骤的 step_id
 
+    # 量化验收标准，供 QualityChecker 自动检查
+    # {"must_include": ["关键词1", ...], "must_not_include": ["禁止词", ...], "min_length": 100, "format_rules": ["有效JSON", ...]}
+    acceptance_criteria: Dict[str, Any] = {}
+
 class TaskResult(BaseModel):
     step_id: str
     status: str               # success / partial / failed

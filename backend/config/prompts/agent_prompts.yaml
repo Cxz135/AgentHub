@@ -42,7 +42,13 @@ agent:
         }},
         "output_format": "期望的输出格式",
         "max_retries": 2,
-        "dependencies": []       // 依赖的前置step_id，如["0"]
+        "dependencies": [],       // 依赖的前置step_id，如["0"]
+        "acceptance_criteria": {{
+          "must_include": ["必须出现的关键词或概念"],
+          "must_not_include": ["禁止出现的错误模式"],
+          "min_length": 100,
+          "format_rules": ["格式要求的具体检查项，如"有效JSON格式""]
+        }}
       }}
     ]
 
@@ -53,6 +59,12 @@ agent:
     3. 如果子任务需要前面任务的结果，必须在 dependencies 中标明。
     4. prompt 应自包含，但可以引用黑板上下文（如"根据之前的查询结果..."），上下文会自动注入。
     5. 仅有独立、可并行的任务才不用填写 dependencies。
+    6. 每个子任务必须填写 acceptance_criteria（验收标准），包含：
+       - must_include: 输出中必须包含的关键词、概念或数据（用于自动检查完整性）
+       - must_not_include: 输出中禁止出现的错误模式（如"执行失败"、"无法完成"等）
+       - min_length: 最小输出长度（字符数，防止截断或空洞回复）
+       - format_rules: 格式要求的具体检查项（如"有效的JSON"、"包含代码块"等）
+       验收标准将用于自动化质量检查，请务必具体、可量化，不要留空。
     {history_context}
 
   evaluator_system: |

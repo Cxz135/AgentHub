@@ -41,6 +41,7 @@ from backend.core.quality_checker import QualityChecker
 from backend.core.replan_evaluator import (
     ReplanEvaluator, EvaluationVerdict, check_hard_replan_conditions,
 )
+from backend.core.plan_analyzer import analyze_plan_complexity, analyze_plan_detail
 from backend.core.config import (
     MAX_REPLAN_LIMIT, QUALITY_THRESHOLD, MAX_TASK_RETRIES, ENABLE_QUALITY_CHECK,
 )
@@ -427,33 +428,34 @@ class Orchestrator:
         latest_message = messages[-1]
         content = latest_message.get("content", "").strip()
 
-        # 📝 任务复杂度判断（使用 LLM 分类器代替关键词匹配）
+        # 📝 Plan-First 复杂度判断：先调用 Planner，再分析计划结构
         logger.info(f"[VERIFY] 对话ID: {conversation_id}，用户输入: {content[:100]}...")
-        complexity_level = await self._classify_complexity(content)
-        if complexity_level == "complex":
-            logger.info(f"[VERIFY] 任务判断：复杂任务，将启动动态规划调度。")
-        elif complexity_level == "moderate":
-            logger.info(f"[VERIFY] 任务判断：中等复杂度任务，将路由到专家 Agent。")
-        else:
-            logger.info(f"[VERIFY] 任务判断：简单任务，无需拆解，进入普通聊天。")
 
-        # 在顶层管理 checkpointer 的生命周期（持久连接，不提前退出）
+        # 在顶层管理 checkpointer 的生命周期
         if not hasattr(self, '_checkpointer') or self._checkpointer is None:
             import aiosqlite
             _conn = await aiosqlite.connect("agenthub_memory.sqlite")
             self._checkpointer = AsyncSqliteSaver(_conn)
         checkpointer = self._checkpointer
         config = {"configurable": {"thread_id": conversation_id}}
-        current_checkpoint = await checkpointer.aget(config)
+        try:
+            current_checkpoint = await checkpointer.aget(config)
+            if current_checkpoint:
+                msg_count = len(current_checkpoint.get('values', {}).get('messages', []))
+                logger.info(f"[MEMORY] 加载历史记忆，当前对话消息数: {msg_count}")
+            else:
+                logger.info(f"[MEMORY] 新对话，无历史记忆，开始记录上下文")
+        except Exception as e:
+            logger.warning(f"[MEMORY] checkpoint 加载失败: {e}")
+            current_checkpoint = None
+
+        # 提取历史摘要供 Planner 使用
+        history_summary = ""
         if current_checkpoint:
-            msg_count = len(current_checkpoint.get('values', {}).get('messages', []))
-            logger.info(f"[MEMORY] 加载历史记忆，当前对话消息数: {msg_count}")
-        else:
-            logger.info(f"[MEMORY] 新对话，无历史记忆，开始记录上下文")
+            history_summary = current_checkpoint.get('values', {}).get('memory_summary', '')
 
         # 1. 第一优先级：检查@mention — 支持多个 @agent
         mentioned_ids = self._find_mentioned_agent_ids(content)
-        # 过滤掉不是真正 Agent 的 @mention（如 override 注入的 "orchestrator"）
         mentioned_ids = [mid for mid in mentioned_ids if mid in self.agents]
         if len(mentioned_ids) >= 2:
             logger.info(f"[VERIFY] 触发多Agent群聊路由: {mentioned_ids}")
@@ -465,37 +467,50 @@ class Orchestrator:
             logger.info(f"[VERIFY] 触发@mention路由: {mentioned_ids[0]}")
             return await self._handle_mention(mentioned_ids[0], conversation_id, messages, request_context or {})
 
-        # 2. 第二优先级：Agent 管理请求
-        if complexity_level == "agent_management":
+        # 2. 第二优先级：Agent 管理请求（保留 LLM 分类仅为此用途）
+        agent_mgmt_level = await self._classify_complexity(content)
+        if agent_mgmt_level == "agent_management":
             logger.info("[VERIFY] LLM 分类为 Agent 管理请求，优先路由到 agent_builder")
             return await self._handle_agent_management_request(conversation_id, messages, request_context or {})
 
         # 3. 第三优先级：自动匹配固定工作流
         matched_workflow, max_score = self._auto_match_workflow(content)
         if matched_workflow and max_score > WORKFLOW_TRIGGER_THRESHOLD:
-            logger.info(f"[VERIFY] 工作流/技能选择：触发固定工作流 '{matched_workflow}'，得分{max_score}达阈值{WORKFLOW_TRIGGER_THRESHOLD}，跳过动态规划")
+            logger.info(f"[VERIFY] 触发固定工作流 '{matched_workflow}'，得分{max_score}")
             return await self._handle_workflow_command(matched_workflow, conversation_id, content, messages,
                                                        checkpointer, progressive_queue=progressive_queue)
-        else:
-            logger.info(f"[VERIFY] 任务判断：匹配得分{max_score}未达阈值({WORKFLOW_TRIGGER_THRESHOLD})，进入深度调度逻辑")
 
-        # 4. 第四优先级：LLM 复杂度路由
-        if complexity_level == "complex":
-            logger.info(f"[VERIFY] 工作流/技能选择：复杂任务，启动动态规划")
-            return await self._handle_plan_command(
-                conversation_id, content, checkpointer, request_context or {},
-                progressive_queue=progressive_queue,
-            )
+        # 4. 第四优先级：Plan-First 路由（先规划、再分析复杂度、再分发）
+        tasks, complexity_level, plan_detail = await self._plan_and_classify(content, history_summary)
+
+        if not tasks:
+            # Planner 失败或空计划 → 降级为 default chat
+            logger.info("[VERIFY] PlanFirst 未生成任务，降级为 default chat")
+            return await self._handle_default_chat(conversation_id, messages, progressive_queue)
+
+        logger.info(
+            f"[VERIFY] PlanFirst 路由: complexity={complexity_level}, "
+            f"steps={plan_detail.get('step_count')}, "
+            f"depth={plan_detail.get('dependency_depth')}, "
+            f"tools={plan_detail.get('tool_diversity')}"
+        )
 
         if complexity_level == "simple":
-            logger.info(f"[VERIFY] 工作流/技能选择：简单任务，Orchestrator 直接回复")
-            return await self._handle_simple_chat(content, messages, progressive_queue)
+            # 1-3 步简单任务：直接循环执行，不走 LangGraph
+            logger.info(f"[VERIFY] Simple 路径：{len(tasks)} 步直接执行")
+            result_text = await self._execute_simple_plan(
+                tasks, content, conversation_id,
+                state={"conversation_id": conversation_id},
+            )
+            return {"agent_id": "orchestrator", "content": result_text}
 
-        if complexity_level == "moderate":
-            logger.info(f"[VERIFY] 工作流/技能选择：中等复杂度任务，路由到主 Agent 直接执行")
-            enhanced_content = f"用户有一个任务交给你，请认真完成，如果需要搜索或调用工具可以自行使用。\n\n任务：{content}"
-            moderate_messages = [{"role": "user", "content": enhanced_content}]
-            return await self._handle_default_chat(conversation_id, moderate_messages, progressive_queue)
+        # moderate / complex：走 LangGraph 规划图
+        logger.info(f"[VERIFY] {complexity_level} 路径：{len(tasks)} 步进入 LangGraph")
+        return await self._handle_plan_command(
+            conversation_id, content, checkpointer, request_context or {},
+            progressive_queue=progressive_queue,
+            pre_generated_tasks=tasks,
+        )
 
         # 5. Skill 调用请求
         skill_call = self._parse_skill_call(content)
@@ -1045,76 +1060,99 @@ class Orchestrator:
             "intermediate_messages": all_outputs,
         }
 
-    async def _handle_plan_command(self, conversation_id: str, task_content: str, checkpointer: AsyncSqliteSaver, request_context: Optional[Dict[str, Any]] = None, progressive_queue: Optional[asyncio.Queue] = None) -> \
-    Dict[str, Any]:
-        """处理复杂任务，执行完整的规划工作流。"""
+    async def _handle_plan_command(
+        self, conversation_id: str, task_content: str,
+        checkpointer: AsyncSqliteSaver,
+        request_context: Optional[Dict[str, Any]] = None,
+        progressive_queue: Optional[asyncio.Queue] = None,
+        pre_generated_tasks: list = None,
+    ) -> Dict[str, Any]:
+        """
+        处理复杂任务，执行完整的规划工作流。
+
+        pre_generated_tasks: 可选。Plan-First 路由预先调用 Planner 生成的任务列表，
+                            传入后跳过 Planner 调用，直接进入 LangGraph。
+        """
         logger.info(f"Chat API: 启动动态规划处理复杂任务: {task_content[:30]}...")
         if not task_content:
             return {"agent_id": "orchestrator", "content": "请输入需要规划的具体任务。"}
 
-        # 1. 手动调用 PlannerAgent 生成计划
-        planner = self.get_agent("planner")
-        if not planner:
-            logger.error("内部错误：规划工作流需要 'planner' Agent，但未找到。")
-            return {"agent_id": "orchestrator", "content": "抱歉，系统配置错误，无法找到规划器。"}
+        # 1. 手动调用 PlannerAgent 生成计划（如果尚未预生成）
+        if pre_generated_tasks:
+            tasks = pre_generated_tasks
+            logger.info(f"[PlanFirst] 使用预生成的 {len(tasks)} 个任务，跳过 Planner 调用")
+        else:
+            planner = self.get_agent("planner")
+            if not planner:
+                logger.error("内部错误：规划工作流需要 'planner' Agent，但未找到。")
+                return {"agent_id": "orchestrator", "content": "抱歉，系统配置错误，无法找到规划器。"}
 
-        # --- 长期记忆读取与 Planner 上下文准备 ---
-        historical_summary = ""
-        config = {"configurable": {"thread_id": conversation_id}}
-        latest_checkpoint = await checkpointer.aget(config)
-        if latest_checkpoint:
-            logger.info(f"[MEMORY] 为对话 {conversation_id} 加载了历史记忆。Checkpoint keys: {list(latest_checkpoint.keys())}")
-            # LangGraph checkpointer使用['values']而不是.channel_values
-            if 'values' in latest_checkpoint:
-                historical_summary = latest_checkpoint['values'].get("memory_summary", "")
-                msg_count = len(latest_checkpoint['values'].get('messages', []))
-                logger.info(f"[MEMORY] 历史消息数: {msg_count}，历史摘要长度: {len(historical_summary)}")
-            else:
-                historical_summary = ""
-
-        available_agents = [agent_id for agent_id in self.agents.keys() if agent_id not in ["planner", "summarizer"]]
-        # 生成统一的技能列表，传给planner
-        skills_prompt = self.get_available_skills_prompt()
-        planner_context = {
-            "available_agents": available_agents, 
-            "historical_summary": historical_summary,
-            "available_skills_prompt": skills_prompt
-        }
-
-        plan_task_message = HumanMessage(content=task_content)
-        if progressive_queue is not None:
-            progressive_queue.put_nowait({"type": "thinking", "agent_id": "planner", "status": "thinking"})
-        logger.info(f"[PROGRESS] 正在调用规划器（PlannerAgent）拆解任务: {task_content[:60]}...")
-        agent_response: AgentResponse = await planner.process_message([plan_task_message], context=planner_context)
-        if progressive_queue is not None:
-            progressive_queue.put_nowait({"type": "thinking", "agent_id": "planner", "status": "done"})
-        logger.info(f"[PROGRESS] 规划器返回结果，长度={len(agent_response.final_answer.content) if agent_response and agent_response.final_answer else 0}")
-
-        if not (agent_response and agent_response.final_answer and agent_response.final_answer.content):
-            return {"agent_id": "orchestrator", "content": "抱歉，规划器未能生成有效的行动计划。"}
-
-        try:
-            plan_data = json.loads(agent_response.final_answer.content)
-            if isinstance(plan_data, dict):
-                tasks_raw = plan_data.get('tasks', [])
-            else:
-                tasks_raw = plan_data
-            tasks = [TaskSpec(**t) for t in tasks_raw]
+        if pre_generated_tasks:
+            # Plan-First 路径：跳过 Planner 调用，直接使用预生成的任务
+            tasks = pre_generated_tasks
             plan_data = {"tasks": tasks}
-            # 兼容两种格式：如果是列表直接用，如果是字典取tasks字段
-            tasks_list = plan_data if isinstance(plan_data, list) else plan_data.get('tasks', [])
-            logger.info(f"[VERIFY] 任务拆解：Planner生成了{len(tasks_list)}个子任务")
-            for i, task in enumerate(tasks_list):
-                if isinstance(task, dict):
-                    logger.info(f"[VERIFY] 子任务{i+1}: {getattr(task, 'description', '')[:50]}...，Agent: {getattr(task, 'agent_id', '')}")
+            tasks_list = [t.model_dump() if hasattr(t, 'model_dump') else (
+                t.dict() if hasattr(t, 'dict') else t
+            ) for t in tasks]
+            logger.info(f"[PlanFirst] 复用预生成的 {len(tasks)} 个任务")
+        else:
+                # --- 长期记忆读取与 Planner 上下文准备 ---
+            historical_summary = ""
+            config = {"configurable": {"thread_id": conversation_id}}
+            latest_checkpoint = await checkpointer.aget(config)
+            if latest_checkpoint:
+                logger.info(f"[MEMORY] 为对话 {conversation_id} 加载了历史记忆。Checkpoint keys: {list(latest_checkpoint.keys())}")
+                # LangGraph checkpointer使用['values']而不是.channel_values
+                if 'values' in latest_checkpoint:
+                    historical_summary = latest_checkpoint['values'].get("memory_summary", "")
+                    msg_count = len(latest_checkpoint['values'].get('messages', []))
+                    logger.info(f"[MEMORY] 历史消息数: {msg_count}，历史摘要长度: {len(historical_summary)}")
                 else:
-                    logger.info(f"[VERIFY] 子任务{i+1}: {str(task)[:50]}...")
-            # 统一格式，确保后续代码能正确处理
-            if isinstance(plan_data, list):
-                plan_data = {"tasks": plan_data}
-        except json.JSONDecodeError:
-            logger.error(f"[VERIFY] 任务拆解失败：计划格式无效，内容: {agent_response.final_answer.content[:100]}")
-            return {"agent_id": "orchestrator", "content": f"抱歉，规划器返回的计划格式无效。"}
+                    historical_summary = ""
+
+            available_agents = [agent_id for agent_id in self.agents.keys() if agent_id not in ["planner", "summarizer"]]
+            # 生成统一的技能列表，传给planner
+            skills_prompt = self.get_available_skills_prompt()
+            planner_context = {
+                "available_agents": available_agents, 
+                "historical_summary": historical_summary,
+                "available_skills_prompt": skills_prompt
+            }
+
+            plan_task_message = HumanMessage(content=task_content)
+            if progressive_queue is not None:
+                progressive_queue.put_nowait({"type": "thinking", "agent_id": "planner", "status": "thinking"})
+            logger.info(f"[PROGRESS] 正在调用规划器（PlannerAgent）拆解任务: {task_content[:60]}...")
+            agent_response: AgentResponse = await planner.process_message([plan_task_message], context=planner_context)
+            if progressive_queue is not None:
+                progressive_queue.put_nowait({"type": "thinking", "agent_id": "planner", "status": "done"})
+            logger.info(f"[PROGRESS] 规划器返回结果，长度={len(agent_response.final_answer.content) if agent_response and agent_response.final_answer else 0}")
+
+            if not (agent_response and agent_response.final_answer and agent_response.final_answer.content):
+                return {"agent_id": "orchestrator", "content": "抱歉，规划器未能生成有效的行动计划。"}
+
+            try:
+                plan_data = json.loads(agent_response.final_answer.content)
+                if isinstance(plan_data, dict):
+                    tasks_raw = plan_data.get('tasks', [])
+                else:
+                    tasks_raw = plan_data
+                tasks = [TaskSpec(**t) for t in tasks_raw]
+                plan_data = {"tasks": tasks}
+                # 兼容两种格式：如果是列表直接用，如果是字典取tasks字段
+                tasks_list = plan_data if isinstance(plan_data, list) else plan_data.get('tasks', [])
+                logger.info(f"[VERIFY] 任务拆解：Planner生成了{len(tasks_list)}个子任务")
+                for i, task in enumerate(tasks_list):
+                    if isinstance(task, dict):
+                        logger.info(f"[VERIFY] 子任务{i+1}: {getattr(task, 'description', '')[:50]}...，Agent: {getattr(task, 'agent_id', '')}")
+                    else:
+                        logger.info(f"[VERIFY] 子任务{i+1}: {str(task)[:50]}...")
+                # 统一格式，确保后续代码能正确处理
+                if isinstance(plan_data, list):
+                    plan_data = {"tasks": plan_data}
+            except json.JSONDecodeError:
+                logger.error(f"[VERIFY] 任务拆解失败：计划格式无效，内容: {agent_response.final_answer.content[:100]}")
+                return {"agent_id": "orchestrator", "content": f"抱歉，规划器返回的计划格式无效。"}
 
         # 将计划内容和 Agent 分配以聊天消息形式发布给用户
         prog_q = progressive_queue
@@ -1470,6 +1508,127 @@ class Orchestrator:
             lines.append("💬 如果有复杂任务，我会自动协调最合适的 Agent 来处理。直接告诉我你的需求即可。")
 
         return "\n".join(lines)
+
+    async def _plan_and_classify(
+        self, task_content: str, history_summary: str = ""
+    ) -> tuple[list, str, dict]:
+        """
+        统一入口：先调用 Planner 生成任务计划，再分析计划复杂度。
+
+        Returns:
+            (tasks: List[TaskSpec], complexity: str, plan_detail: dict)
+        """
+        from backend.agents.internal.planner_agent import PlannerAgent
+        from backend.models.task_spec import TaskSpec
+        from langchain_core.messages import HumanMessage
+
+        # 1. 调用 Planner 生成计划
+        planner = self.get_agent("planner")
+        if not planner:
+            logger.warning("[PlanFirst] planner agent 未注册，回退为 simple")
+            return [], "simple", {}
+
+        available_agents = [aid for aid in self.agents.keys()
+                           if aid not in ("planner", "summarizer")]
+        skills_prompt = self.get_available_skills_prompt()
+        plan_message = HumanMessage(content=task_content)
+        planner_context = {
+            "available_agents": available_agents,
+            "historical_summary": history_summary,
+            "available_skills_prompt": skills_prompt,
+        }
+        try:
+            agent_response = await planner.process_message(
+                [plan_message], context=planner_context
+            )
+            plan_json = json.loads(agent_response.final_answer.content)
+        except Exception as e:
+            logger.warning(f"[PlanFirst] Planner 调用失败: {e}，回退为 simple")
+            return [], "simple", {}
+
+        # 2. 解析计划
+        if isinstance(plan_json, dict):
+            tasks_raw = plan_json.get("tasks", plan_json.get("plan", []))
+        elif isinstance(plan_json, list):
+            tasks_raw = plan_json
+        else:
+            logger.warning("[PlanFirst] 计划格式未知，回退为 simple")
+            return [], "simple", {}
+
+        if not tasks_raw:
+            return [], "simple", {}
+
+        try:
+            tasks = [TaskSpec(**t) for t in tasks_raw]
+        except Exception as e:
+            logger.warning(f"[PlanFirst] TaskSpec 构造失败: {e}")
+            return [], "simple", {}
+
+        # 3. 分析计划复杂度
+        complexity = analyze_plan_complexity(tasks)
+        plan_detail = analyze_plan_detail(tasks)
+
+        logger.info(
+            f"[PlanFirst] planner 生成 {len(tasks)} 个任务，"
+            f"复杂度={complexity}，详情={plan_detail}"
+        )
+        return tasks, complexity, plan_detail
+
+    async def _execute_simple_plan(
+        self, tasks: list, task_content: str, conversation_id: str,
+        state: dict = None,
+    ) -> str:
+        """
+        Simple 路径：直接循环执行 1-3 步任务，不走 LangGraph 规划图。
+
+        复用 _execute_single_task_with_retry，减少序列化开销。
+        结果按步骤顺序拼接返回。
+        """
+        logger.info(f"[SimplePath] 直接执行 {len(tasks)} 个简单任务")
+        results = []
+        step_results = {}
+        task_states = {}
+        quality_reports = {}
+
+        workspace = {}
+        for task in tasks:
+            sid = getattr(task, "step_id", "")
+            prompt = getattr(task, "prompt", "")
+            agent_id = getattr(task, "agent_id", "tongyi")
+
+            # 构建 workspace 上下文
+            workspace_context = ""
+            if workspace:
+                workspace_context = "\n=== 前序任务结果 ===\n"
+                for k, v in workspace.items():
+                    workspace_context += f"- {k}: {str(v)[:300]}...\n"
+
+            skills_prompt = self.get_available_skills_prompt()
+            runtime_context = f"=== 执行上下文 ===\n- conversation_id: {conversation_id}"
+            full_prompt = f"{skills_prompt}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}"
+
+            result_text, task_state, quality = await self._execute_single_task_with_retry(
+                task=task,
+                base_prompt=full_prompt,
+                state=state or {"conversation_id": conversation_id},
+                conversation_id=conversation_id,
+            )
+
+            step_results[sid] = result_text
+            task_states[sid] = task_state
+            if quality:
+                quality_reports[sid] = quality
+            workspace[f"task_{sid}_output"] = result_text
+
+            status_icon = "✅" if task_state in (TaskState.SUCCEEDED, TaskState.RETRIED) else "❌"
+            tag = f"[{agent_id}]" if agent_id else ""
+            results.append(f"{status_icon} 步骤{sid} {tag}:\n{result_text}")
+            logger.info(f"[SimplePath] 步骤{sid} 完成({task_state})")
+
+        # 拼接所有结果
+        combined = "\n\n".join(results)
+        logger.info(f"[SimplePath] 所有 {len(tasks)} 步完成")
+        return combined
 
     async def _classify_complexity(self, user_message: str, history_summary: str = "") -> str:
         """
@@ -1982,16 +2141,18 @@ class Orchestrator:
                 )
                 last_result = output_text
 
-                # 质量检查
+                # 质量检查（携带验收标准）
                 quality = None
                 if self.quality_checker:
                     expected_fmt = getattr(task, "output_format", "自然语言")
                     task_prompt = getattr(task, "prompt", "")
+                    acceptance_criteria = getattr(task, "acceptance_criteria", {}) or {}
                     quality = await self.quality_checker.assess(
                         task_id=task.step_id,
                         result=output_text,
                         task_prompt=task_prompt,
                         expected_format=expected_fmt,
+                        acceptance_criteria=acceptance_criteria,
                     )
                     last_quality = {
                         "task_id": task.step_id,

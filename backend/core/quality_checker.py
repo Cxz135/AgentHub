@@ -98,12 +98,46 @@ def _check_format_compliance(result: str, expected_format: str) -> Optional[str]
     return None
 
 
+def _check_acceptance_criteria(result: str, criteria: dict) -> List[str]:
+    """
+    根据验收标准检查结果。
+
+    criteria 格式：
+    {"must_include": [...], "must_not_include": [...], "min_length": int, "format_rules": [...]}
+    """
+    failures = []
+    if not criteria or not isinstance(criteria, dict):
+        return failures
+
+    # must_include：必须包含的关键词
+    must_include = criteria.get("must_include", [])
+    if must_include:
+        for keyword in must_include:
+            if str(keyword).lower() not in result.lower():
+                failures.append(f"验收不通过：缺少必须内容「{keyword}」")
+
+    # must_not_include：禁止出现的错误模式
+    must_not_include = criteria.get("must_not_include", [])
+    if must_not_include:
+        for pattern in must_not_include:
+            if str(pattern).lower() in result.lower():
+                failures.append(f"验收不通过：包含禁止内容「{pattern}」")
+
+    # min_length：最小输出长度
+    min_length = criteria.get("min_length", 0)
+    if isinstance(min_length, (int, float)) and min_length > 0:
+        if len(result.strip()) < int(min_length):
+            failures.append(f"验收不通过：输出长度 {len(result.strip())} < 要求 {int(min_length)}")
+
+    return failures
+
+
 class QualityChecker:
     """
     内容质量评估器。
 
     两层评估策略：
-    1. 规则引擎：空内容、异常关键词、长度过短、格式校验 → 直接判定
+    1. 规则引擎：空内容、异常关键词、长度过短、格式校验、验收标准检查 → 直接判定
     2. LLM 轻量评估：仅在规则引擎标记可疑时调用，评估完整性/相关性/可用性
     """
 
@@ -123,6 +157,7 @@ class QualityChecker:
         result: str,
         task_prompt: str = "",
         expected_format: str = "自然语言",
+        acceptance_criteria: dict = None,
     ) -> QualityReport:
         """
         对单个子任务结果做质量评估。
@@ -132,6 +167,7 @@ class QualityChecker:
             result: 子任务执行结果文本
             task_prompt: 原始任务指令（用于 LLM 评估上下文）
             expected_format: 期望的输出格式
+            acceptance_criteria: 验收标准 {"must_include": [...], ...}
 
         Returns:
             QualityReport 评估报告
@@ -166,6 +202,13 @@ class QualityChecker:
         err = _check_format_compliance(result, expected_format)
         if err:
             failures.append(err)
+
+        # 验收标准检查（must_include / must_not_include / min_length）
+        if acceptance_criteria:
+            ac_failures = _check_acceptance_criteria(result, acceptance_criteria)
+            failures.extend(ac_failures)
+            if ac_failures:
+                logger.info(f"[QualityChecker] 任务{task_id} 验收标准失败: {ac_failures}")
 
         # 规则引擎全部通过 → 直接判定合格
         if not failures:
@@ -204,7 +247,7 @@ class QualityChecker:
                 strategy="rules",
             )
 
-        llm_result = await self._llm_assess(task_id, result, task_prompt)
+        llm_result = await self._llm_assess(task_id, result, task_prompt, acceptance_criteria)
         if llm_result is None:
             # LLM 评估失败 → 降级为规则引擎结果
             logger.warning(f"[QualityChecker] 任务{task_id} LLM评估失败，降级为规则判定")
@@ -241,20 +284,38 @@ class QualityChecker:
         )
 
     async def _llm_assess(
-        self, task_id: str, result: str, task_prompt: str
+        self, task_id: str, result: str, task_prompt: str,
+        acceptance_criteria: dict = None,
     ) -> Optional[dict]:
-        """LLM 轻量评估子任务结果质量。"""
+        """LLM 轻量评估子任务结果质量，携带验收标准进行逐条对照。"""
         system_prompt = (
             "你是子任务结果质量评审员。请评估候选回答的质量，"
             "从完整性（是否完整回答问题）、相关性（是否偏离目标）、"
             "可用性（是否可被后续任务直接使用）三个维度打分。"
+            "如果有验收标准，请逐条对照检查。"
             '严格输出 JSON：{"pass": true|false, "score": 0-100, '
             '"completeness": 0-100, "relevance": 0-100, "usability": 0-100, '
             '"reasons": ["理由1", ...]}。禁止输出任何其它文本。'
         )
         task_context = f"\n【任务指令】\n{task_prompt[:500]}" if task_prompt else ""
+
+        # 注入验收标准
+        criteria_context = ""
+        if acceptance_criteria:
+            criteria_parts = []
+            if acceptance_criteria.get("must_include"):
+                criteria_parts.append(f"必须包含: {acceptance_criteria['must_include']}")
+            if acceptance_criteria.get("must_not_include"):
+                criteria_parts.append(f"禁止出现: {acceptance_criteria['must_not_include']}")
+            if acceptance_criteria.get("min_length"):
+                criteria_parts.append(f"最小长度: {acceptance_criteria['min_length']} 字符")
+            if acceptance_criteria.get("format_rules"):
+                criteria_parts.append(f"格式要求: {acceptance_criteria['format_rules']}")
+            if criteria_parts:
+                criteria_context = "\n【验收标准】\n" + "\n".join(criteria_parts) + "\n请逐条对照检查。"
+
         user_prompt = (
-            f"【候选回答（前1000字）】\n{result[:1000]}{task_context}\n\n"
+            f"【候选回答（前1000字）】\n{result[:1000]}{task_context}{criteria_context}\n\n"
             '请输出 JSON：{"pass": ..., "score": ..., "completeness": ..., '
             '"relevance": ..., "usability": ..., "reasons": [...]}'
         )
