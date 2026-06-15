@@ -1077,8 +1077,12 @@ class Orchestrator:
             return {"agent_id": "orchestrator", "content": "请输入需要规划的具体任务。"}
 
         # 1. 加载长期记忆（Plan-First 和 Planner 路径共用）
-        config = {"configurable": {"thread_id": conversation_id}}
-        latest_checkpoint = await checkpointer.aget(config)
+        # 使用独立 sub_thread_id 防止旧对话的 checkpoint 污染当前执行
+        import time as _time
+        run_id = f"{conversation_id}_run{int(_time.time())}"
+        config = {"configurable": {"thread_id": run_id}}
+        memory_config = {"configurable": {"thread_id": conversation_id}}
+        latest_checkpoint = await checkpointer.aget(memory_config)
         historical_summary = ""
         if latest_checkpoint:
             if 'values' in latest_checkpoint:
@@ -1182,6 +1186,7 @@ class Orchestrator:
             # 显式初始化所有状态字段，防止旧 checkpoint 数据污染
             task_states={}, quality_reports={}, replan_context={},
             orchestrator_state=OrchestratorState.RUNNING, plan_iteration=0,
+            agent_outputs=[], shared_workspace={},
         )
         initial_state["current_user_id"] = (request_context or {}).get("current_user_id")
 
