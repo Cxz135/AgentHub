@@ -3,7 +3,6 @@ import json
 import re
 import os
 import importlib
-import yaml
 from typing import List, Dict, Any, Callable, Optional, AsyncGenerator
 
 
@@ -45,6 +44,7 @@ from backend.core.plan_analyzer import analyze_plan_complexity, analyze_plan_det
 from backend.core.config import (
     MAX_REPLAN_LIMIT, QUALITY_THRESHOLD, MAX_TASK_RETRIES, ENABLE_QUALITY_CHECK,
 )
+from backend.core.artifact_parser import parse_artifacts, push_artifacts_to_queue
 
 # 一个简单的正则表达式，用于从消息内容中匹配 @agent_id
 MENTION_REGEX = r'@(\w+)'
@@ -467,9 +467,8 @@ class Orchestrator:
             logger.info(f"[VERIFY] 触发@mention路由: {mentioned_ids[0]}")
             return await self._handle_mention(mentioned_ids[0], conversation_id, messages, request_context or {})
 
-        # 2. 第二优先级：Agent 管理请求（保留 LLM 分类仅为此用途）
-        agent_mgmt_level = await self._classify_complexity(content)
-        if agent_mgmt_level == "agent_management":
+        # 2. 第二优先级：Agent 管理请求（关键词匹配，不消耗 LLM）
+        if self._is_agent_management_request(content):
             logger.info("[VERIFY] LLM 分类为 Agent 管理请求，优先路由到 agent_builder")
             return await self._handle_agent_management_request(conversation_id, messages, request_context or {})
 
@@ -1024,7 +1023,7 @@ class Orchestrator:
             logger.info(f"[MULTI-MENTION] 调用 Agent: {agent_id}")
             result = await self._handle_mention(agent_id, conversation_id, messages, request_context)
             content = result.get("content", "")
-            artifacts = self._parse_artifacts(content)
+            artifacts = parse_artifacts(content)
             entry = {"agent_id": agent_id, "content": content, "artifacts": artifacts}
             all_outputs.append(entry)
             if progressive_queue is not None:
@@ -1396,24 +1395,6 @@ class Orchestrator:
             )
             return {"agent_id": main_chat_agent.agent_id, "content": output}
 
-
-    async def _handle_simple_chat(self, content: str, messages: List[Dict], progressive_queue: asyncio.Queue = None) -> Dict[str, Any]:
-        """
-        处理简单聊天：Orchestrator 直接调用 LLM 回复，不经过 Agent。
-        用于简单闲聊、问候等不需要工具调用的场景。
-        不推送事件到 progressive_queue，由 get_chat_stream 统一处理流式输出。
-        """
-        prompt = self.prompt_loader.get('orchestrator', 'simple_chat', content=content)
-
-        try:
-            response = await self.get_backend("tongyi").chat([{"role": "user", "content": prompt}])
-            final_content = response.strip() if isinstance(response, str) else str(response).strip()
-        except Exception as e:
-            logger.error(f"[SIMPLE-CHAT] LLM 调用失败: {e}")
-            final_content = "你好！很高兴为你服务。请问有什么我可以帮你的？"
-
-        return {"agent_id": "orchestrator", "content": final_content}
-
     def _handle_system_query(self, content: str) -> str | None:
         """
         检测用户是否在询问系统信息（Agent列表、Skill列表、Orchestrator自身能力等），
@@ -1624,61 +1605,16 @@ class Orchestrator:
         logger.info(f"[SimplePath] 所有 {len(tasks)} 步完成")
         return combined
 
-    async def _classify_complexity(self, user_message: str, history_summary: str = "") -> str:
-        """
-        使用 LLM 将用户请求分类为: agent_management / simple / moderate / complex
-        返回字符串供路由使用。
-        """
-        prompt = self.prompt_loader.get('orchestrator', 'complexity_classification',
-            user_message=user_message,
-            history_summary=history_summary if history_summary else "无"
-        )
-
-        messages = [{"role": "user", "content": prompt}]
-        try:
-            resp = await self.get_backend("tongyi").chat(messages)
-            content = resp.strip().lower() if isinstance(resp, str) else str(resp).strip().lower()
-            if content in ("simple", "moderate", "complex", "agent_management"):
-                return content
-        except Exception as e:
-            logger.warning(f"LLM 复杂度分类失败，降级为关键词规则: {e}")
-
-        return self._fallback_complexity_rule(user_message)
-
-    def _fallback_complexity_rule(self, user_message: str) -> str:
-        """
-        当 LLM 分类失败时的关键词降级逻辑。
-        """
-        content = user_message.lower().strip()
-
-        # 短问候直接判 simple
-        if len(content) < 15:
-            return "simple"
-
-        # 复杂协作类关键词：需要多角色协作或多步骤
-        complex_keywords = [
-            "开发一个", "帮我设计", "帮我开发", "帮我实现",
-            "架构", "整体方案", "方案设计", "重构",
-            "项目", "系统", "全栈", "前后端",
-            "部署", "上线", "微服务", "分布式",
+    def _is_agent_management_request(self, content: str) -> bool:
+        """关键词匹配：检测是否为 Agent 管理请求（创建/修改/删除 Agent）。"""
+        keywords = [
+            "创建agent", "创建一个agent", "新建agent", "添加agent",
+            "修改agent", "更新agent", "编辑agent", "删除agent",
+            "创建智能体", "新建智能体", "修改智能体",
+            "agent管理", "管理agent", "列出agent", "有哪些agent",
         ]
-        if any(kw in content for kw in complex_keywords):
-            return "complex"
-
-        # 中等长度 + 技术性关键词
-        moderate_keywords = [
-            "写一个", "帮我写", "实现",
-            "写代码", "开发", "编程", "构建", "创建",
-            "debug", "排查", "快速排序", "算法", "设计",
-            "优化", "改进", "分析", "解释", "比较", "对比",
-            "搜索", "查询", "推荐", "评价", "审查", "检查代码",
-            "帮我看看", "总结", "概括", "翻译", "改写",
-        ]
-        if len(content) > 30 and any(kw in content for kw in moderate_keywords):
-            return "moderate"
-
-        # 默认判 simple
-        return "simple"
+        content_lower = content.lower().strip()
+        return any(kw in content_lower for kw in keywords)
 
     def _build_planning_graph(self) -> StateGraph:
         from langgraph.graph import StateGraph, END
@@ -1711,142 +1647,6 @@ class Orchestrator:
         workflow.add_edge("generate_summary", END)
 
         return workflow
-        
-    @staticmethod
-    def _parse_artifacts(text: str) -> list[dict]:
-        """
-        从 Agent 输出中提取代码块和 markdown 内容作为 artifact。
-        1. 匹配 ```lang\\n...``` 标准代码围栏
-        2. 检测裸 markdown（标题、列表、分隔线等）
-        3. 检测无围栏的代码块（连续缩进行）
-        返回 list[dict]，每个 dict 包含 type/title/content/language。
-        """
-        import re
-        artifacts = []
-
-        # 1. 标准代码围栏
-        fenced_pattern = r'```(\w*)\s*\n(.*?)```'
-        for match in re.finditer(fenced_pattern, text, re.DOTALL):
-            lang = match.group(1).strip() or 'text'
-            code = match.group(2)
-            art_type = 'html_preview' if lang in ('html',) else \
-                       'diagram' if lang in ('mermaid', 'graphviz') else \
-                       'markdown' if lang in ('markdown', 'md') else \
-                       'code'
-            artifacts.append({
-                "type": art_type,
-                "title": lang.upper() if lang != 'text' else '代码',
-                "content": code,
-                "language": lang,
-            })
-        # 从文本中移除已匹配的围栏，防止二次解析
-        text = re.sub(fenced_pattern, '', text, flags=re.DOTALL)
-
-        # 2. 检测裸 markdown（标题、列表、分隔线、引用等）
-        lines = text.split('\n')
-        in_bare_md = False
-        md_lines = []
-        consecutive_non_code = 0  # 连续非代码行计数器，用于跨越代码中的注释行/docstring
-        _code_start_added = False   # 标记：代码特征行是否已通过 code indicator 分支加入了 md_lines
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            # 裸 markdown 行：# 标题、--- 分隔、> 引用、- 列表、1. 列表
-            is_md = (
-                stripped.startswith('# ') or
-                stripped.startswith('## ') or
-                stripped.startswith('### ') or
-                stripped.startswith('- ') or
-                stripped.startswith('* ') or
-                re.match(r'^\d+\. ', stripped) or
-                stripped.startswith('> ') or
-                stripped.startswith('---') or
-                stripped.startswith('| ')
-            )
-            # 代码行（非 markdown）：以 4+ 空格缩进开头，且不是列表
-            # 扩展：支持 shebang、装饰器、class/函数定义、docstring 等代码特征
-            is_code_indented = (
-                (line.startswith('    ') or line.startswith('\t')) and
-                stripped and
-                not stripped.startswith('-') and
-                not stripped.startswith('*') and
-                not stripped.startswith('#')
-            )
-            code_indicators = [
-                stripped.startswith('#!'),          # shebang: #!/usr/bin/env python3
-                stripped.startswith('@'),           # 装饰器: @app.route(...)
-                stripped.startswith('def '),        # 函数定义
-                stripped.startswith('class '),      # 类定义
-                stripped.startswith('async def '),  # async 函数
-                stripped.startswith('import '),     # import 语句
-                stripped.startswith('from '),       # from...import 语句
-                stripped.startswith('if __name__'), # if __name__ == '__main__'
-                '"""' in stripped or "'''" in stripped,  # 单行 docstring
-                stripped.startswith('# -*-'),       # -*- coding: utf-8 -*-
-                stripped.startswith('# coding:'),
-            ]
-            is_code_indicator = any(code_indicators)
-            # 如果当前行有代码特征（shebang/def/import/装饰器等），视为代码行
-            # 这可以独立于缩进检测到代码，即使不在缩进块中
-            is_code_line = is_code_indented or (
-                is_code_indicator and
-                not stripped.startswith('# ') and    # 排除纯注释行（如 # coding: utf-8）
-                not stripped.startswith('## ') and
-                not stripped.startswith('### ') and
-                not stripped.startswith('#!')         # 但保留 shebang
-            )
-            # 如果检测到代码特征行，立即将 in_bare_md 设为 True，使后续缩进行能累积
-            _line_added_this_iter = False
-            if is_code_indicator and not in_bare_md:
-                in_bare_md = True
-                md_lines = [stripped] if stripped else []
-                _line_added_this_iter = True
-            if is_md or is_code_line:
-                if not in_bare_md:
-                    in_bare_md = True
-                    md_lines = [stripped] if stripped else []
-                elif not _line_added_this_iter:
-                    # 仅在尚未通过 code indicator 分支添加时才追加
-                    md_lines.append(stripped)
-                consecutive_non_code = 0
-            else:
-                # 当前行既不是 markdown 也不是代码
-                # 如果正在累积代码块，仍将其加入 md_lines（跨越注释/docstring行）
-                # 但如果该行已经通过 code indicator 分支加入了，则不重复添加
-                if in_bare_md and not _line_added_this_iter:
-                    md_lines.append(stripped)
-                consecutive_non_code += 1
-                if in_bare_md and len(md_lines) >= 3 and consecutive_non_code >= 4:
-                    content = '\n'.join(md_lines)
-                    is_markdown = any(
-                        md_lines[j].startswith(('# ', '## ', '### ', '- ', '* ', '> ', '---', '| '))
-                        for j in range(min(3, len(md_lines)))
-                    )
-                    artifacts.append({
-                        "type": 'markdown' if is_markdown else 'code',
-                        "title": 'Markdown' if is_markdown else '代码',
-                        "content": content,
-                        "language": 'markdown' if is_markdown else 'text',
-                    })
-                    in_bare_md = False
-                    md_lines = []
-                    consecutive_non_code = 0
-
-        # 处理末尾
-        if in_bare_md and len(md_lines) >= 3:
-            content = '\n'.join(md_lines)
-            is_markdown = any(
-                md_lines[j].startswith(('# ', '## ', '### ', '- ', '* ', '> ', '---', '| '))
-                for j in range(min(3, len(md_lines)))
-            )
-            artifacts.append({
-                "type": 'markdown' if is_markdown else 'code',
-                "title": 'Markdown' if is_markdown else '代码',
-                "content": content,
-                "language": 'markdown' if is_markdown else 'text',
-            })
-
-        return artifacts
-
     async def _execute_tasks_node(self, state: GraphState) -> Dict[str, Any]:
         """
         执行Planner生成的计划中的所有子任务，支持并行调度独立任务
@@ -1966,23 +1766,14 @@ class Orchestrator:
                         state["shared_workspace"] = current_workspace
                     agent_id = r.get("agent_id") or (getattr(task_info, "agent_id", "agent") if task_info else "agent")
                     # 收集 Agent 输出（用于前端展示依次回复）
-                    artifacts = self._parse_artifacts(r["result"])
+                    artifacts = parse_artifacts(r["result"])
                     agent_outputs.append({
                         "agent_id": agent_id,
                         "content": r["result"],
                         "artifacts": artifacts,
                     })
                     # 实时推送 artifact 到 SSE 队列
-                    prog_q = getattr(self, '_progressive_queue', None)
-                    if prog_q is not None:
-                        for art in artifacts:
-                            prog_q.put_nowait({
-                                "agent_id": agent_id,
-                                "type": art.get("type", "code"),
-                                "title": art.get("title", "代码"),
-                                "content": art.get("content", ""),
-                                "artifacts": [art],
-                            })
+                    push_artifacts_to_queue(artifacts, getattr(self, '_progressive_queue', None), agent_id)
                     # 子任务完成后实时保存到数据库
                     conv_id = state.get("conversation_id")
                     if conv_id and self.db_session:
@@ -2068,23 +1859,14 @@ class Orchestrator:
                 )
 
             # 收集 Agent 输出
-            artifacts = self._parse_artifacts(result_text)
+            artifacts = parse_artifacts(result_text)
             agent_outputs.append({
                 "agent_id": agent_id,
                 "content": result_text,
                 "artifacts": artifacts,
             })
             # 实时推送 artifact 到 SSE 队列
-            prog_q = getattr(self, '_progressive_queue', None)
-            if prog_q is not None:
-                for art in artifacts:
-                    prog_q.put_nowait({
-                        "agent_id": agent_id,
-                        "type": art.get("type", "code"),
-                        "title": art.get("title", "代码"),
-                        "content": art.get("content", ""),
-                        "artifacts": [art],
-                    })
+            push_artifacts_to_queue(artifacts, getattr(self, '_progressive_queue', None), agent_id)
             status_icon = "✅" if task_state in (TaskState.SUCCEEDED, TaskState.RETRIED) else "❌"
             logger.info(f"📤 顺序子任务{task.step_id}完成({task_state})，结果：{result_text[:100]}...")
 
@@ -2286,54 +2068,6 @@ class Orchestrator:
             if debug_tasks:
                 logger.info(f"[MEMORY] 选择性遗忘：发现{len(debug_tasks)}个调试类子任务，相关临时结果已清理")
 
-    def _load_custom_agents(self):
-        """
-        从 YAML 文件加载自定义 Agent 配置，并创建和注册它们。
-        """
-        try:
-            # YAML 文件路径相对于当前文件
-            config_path = os.path.join(os.path.dirname(__file__), '..', 'custom_agents.yaml')
-            with open(config_path, 'r', encoding='utf-8') as f:
-                custom_agent_configs = yaml.safe_load(f)
-
-            if not custom_agent_configs:
-                logger.warning("custom_agents.yaml 文件为空或不存在，未加载任何自定义 Agent。")
-                return
-
-            for config in custom_agent_configs:
-                agent_id = config.get("agent_id")
-                if not agent_id:
-                    logger.warning(f"跳过一个自定义 Agent，因为它没有 'agent_id'。配置: {config}")
-                    continue
-
-                llm_config = config.get("llm_config", {})
-                adapter_id = llm_config.get("adapter_id", "tongyi")
-                backend = self.llm_backends.get(adapter_id)
-
-                if not backend:
-                    logger.warning(f"跳过自定义 Agent '{agent_id}'，因为找不到后端 '{adapter_id}'。可用后端: {list(self.llm_backends.keys())}")
-                    continue
-
-                try:
-                    system_prompt = config.get("system_prompt", "你是一个乐于助人的AI助手。")
-                    agent_name = config.get("name", agent_id)
-                    custom_agent = CustomAgent(
-                        agent_id=agent_id,
-                        system_prompt=system_prompt,
-                        llm_backend=backend,
-                        name=agent_name
-                    )
-                    self.register_agent(custom_agent)
-                    logger.info(f"成功加载自定义 Agent: '{agent_name}' ({agent_id}) (后端: {adapter_id})")
-
-                except Exception as e:
-                    logger.error(f"加载自定义 Agent '{agent_id}' 时出错: {e}", exc_info=True)
-
-        except FileNotFoundError:
-            logger.warning(f"自定义 Agent 配置文件未找到: {config_path}")
-        except Exception as e:
-            logger.error(f"加载 custom_agents.yaml 文件时发生未知错误: {e}", exc_info=True)
-
     def _setup_agents(self):
         """初始化并注册所有 Agent。使用统一的 LLMBackend 体系。"""
         default_backend = self.get_backend("tongyi")
@@ -2355,8 +2089,6 @@ class Orchestrator:
             logger.info("核心 Agent 'deepseek' 已注册（旧适配器模式，计划废弃）。")
         except Exception as e:
             logger.warning(f"无法注册核心 Agent 'deepseek': {e}")
-
-        self._load_custom_agents()
 
     def _register_workflows(self):
         """动态扫描、导入并注册所有工作流插件。"""
