@@ -738,8 +738,7 @@ class Orchestrator:
             t_agent = _time.time()
             try:
                 if hasattr(attempt_agent, 'executor'):
-                    # 智能判断：纯生成任务（代码/文档/大纲/路线图）不需要工具搜索
-                    # 检查 prompt 是否引用了任何工具名或 SKILL_CALL
+                    # 检测任务是否需要工具（prompt 是否引用了工具名或 SKILL_CALL）
                     _tool_keywords = [t.name for t in self.langchain_tools] + [
                         "SKILL_CALL", "web_search", "rag_retrieval",
                         "scan_vulnerabilities", "file_converter",
@@ -747,12 +746,19 @@ class Orchestrator:
                     _needs_tools = any(
                         kw.lower() in (prompt or "").lower() for kw in _tool_keywords
                     )
-                    if not _needs_tools:
-                        logger.info(
-                            f"🎯 {attempt_agent.agent_id} 纯生成任务（prompt无工具引用），"
-                            f"跳过 ReAct 循环，直接调用 LLM"
+                    # 根据任务类型注入不同的 ReAct 行为约束
+                    if _needs_tools:
+                        _react_hint = (
+                            "\n\n【工具使用约束】你最多调用工具 3 次。"
+                            "如果连续 2 次搜索返回空结果，必须停止搜索，"
+                            "直接基于已有知识输出 Final Answer。"
+                            "禁止用不同措辞重复搜索同一主题。"
                         )
-                        raise AttributeError("skip_react")  # 触发 except → process_message 降级
+                    else:
+                        _react_hint = (
+                            "\n\n【注意】这是代码/文档/大纲生成任务，一般不需要搜索工具。"
+                            "优先直接输出 Final Answer。如确需查资料，最多调用 1 次工具。"
+                        )
 
                     if prompt is None and messages:
                         lines = []
@@ -772,7 +778,7 @@ class Orchestrator:
                         label = "主 Agent" if attempt_agent is agent else f"回退 Agent ({attempt_agent.agent_id})"
                         logger.info(f"🚀 统一调用 {label} {attempt_agent.agent_id} 的 ReAct 执行器")
                         logger.info(f"📋 ReAct 可用工具列表: {[t.name for t in self.langchain_tools]}")
-                        full_prompt = f"【重要】你必须始终使用中文回复，不得切换到其他语言。\n当前日期：{datetime.now().strftime('%Y年%m月%d日')}\n\n用户问题：{prompt}"
+                        full_prompt = f"【重要】你必须始终使用中文回复，不得切换到其他语言。\n当前日期：{datetime.now().strftime('%Y年%m月%d日')}{_react_hint}\n\n用户问题：{prompt}"
                         logger.info(f"🔧 开始调用 executor.ainvoke，工具数: {len(self.langchain_tools)}, 工具名: {[t.name for t in self.langchain_tools]}")
 
                         if progressive_queue is not None:
@@ -807,10 +813,6 @@ class Orchestrator:
                             raise RuntimeError(f"Agent 输出了错误内容: {str(output)[:200]}")
                         checked = _apply_completeness_check(output, user_last_msg, attempt_agent)
                         return checked
-            except AttributeError:
-                # skip_react: 纯生成任务，直接跳到 process_message
-                logger.info(f"🎯 跳过 ReAct，直接使用 process_message")
-                break
             except Exception as e:
                 last_error = e
                 err_type = "主 Agent" if attempt_agent is agent else f"回退 Agent ({attempt_agent.agent_id})"
