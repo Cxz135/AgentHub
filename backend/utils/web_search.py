@@ -1,11 +1,18 @@
 import os
+import re
 import requests
 import json
 import logging
+from collections import OrderedDict
 
 from backend.utils.logger import logger
 from dotenv import load_dotenv
 load_dotenv()
+
+# 搜索结果配置
+MAX_RESULTS = 5          # 最多返回条数
+MAX_SNIPPET_LEN = 300    # 每条摘要最大字符数
+MIN_RELEVANCE_SCORE = 1  # 最低相关性分数（低于此值丢弃）
 
 
 def web_search(query: str) -> str:
@@ -64,13 +71,23 @@ def web_search(query: str) -> str:
         data = resp.json()
         logger.info(f"[web_search] 响应 JSON 根字段: {list(data.keys())}")
 
-        result = _parse_search_response(data)
-
-        if not result:
+        raw_items = _parse_search_response_raw(data)
+        if not raw_items:
             logger.warning("[web_search] API 返回空结果")
-            return f"搜索API返回空结果"
+            return "搜索API返回空结果"
 
-        logger.info(f"[web_search] 搜索成功，结果长度: {len(result)}")
+        logger.info(f"[web_search] 原始结果数: {len(raw_items)}")
+
+        # 清洗 + 去重 + 相关性排序
+        cleaned = _clean_and_rerank(raw_items, query)
+
+        if not cleaned:
+            logger.warning("[web_search] 清洗后无有效结果")
+            return "搜索API返回空结果"
+
+        # 格式化输出
+        result = _format_results(cleaned)
+        logger.info(f"[web_search] 搜索成功，清洗后 {len(cleaned)} 条，总长度: {len(result)}")
         logger.info(f"[web_search] 最终返回内容预览: {result[:200]}")
         return f"🔍 搜索结果（{query}）：\n{result}"
 
@@ -82,58 +99,148 @@ def web_search(query: str) -> str:
         return f"搜索失败: {e}"
 
 
-def _parse_search_response(data: dict) -> str:
-    """解析搜索 API 响应，提取结果文本"""
-    result = ""
+def _parse_search_response_raw(data: dict) -> list[dict]:
+    """解析搜索 API 响应，返回原始条目列表 [{title, url, content, date}]"""
+    items = []
 
-    results_list = data.get("results", [])
-    if results_list:
-        parts = []
-        for item in results_list[:5]:
-            title = item.get("title", "")
-            url = item.get("url", "")
-            snippet = item.get("snippet", "") or item.get("content", "")
-            if snippet:
-                parts.append(f"【{title}】{snippet}" + (f"（来源：{url}）" if url else ""))
-        result = "\n".join(parts)
-        logger.info(f"[web_search] 从 results 数组提取到 {len(results_list)} 条结果")
+    def _extract(item_list, content_key="content"):
+        for item in item_list:
+            title = (item.get("title") or "").strip()
+            url = (item.get("url") or "").strip()
+            content = (item.get(content_key) or item.get("snippet") or "").strip()
+            date = (item.get("date") or "").strip()
+            if content:
+                items.append({"title": title, "url": url, "content": content, "date": date})
 
-    if not result:
-        references = data.get("references", [])
-        if references:
-            parts = []
-            for item in references[:5]:
-                title = item.get("title", "")
-                url = item.get("url", "")
-                content = item.get("content", "")
-                if content:
-                    parts.append(f"【{title}】{content}" + (f"（来源：{url}）" if url else ""))
-            result = "\n".join(parts)
-            logger.info(f"[web_search] 从 references 提取到 {len(references)} 条结果")
+    _extract(data.get("results", []), "content")
+    if not items:
+        _extract(data.get("references", []), "content")
+    if not items:
+        _extract(data.get("data", {}).get("results", []), "content")
 
-    if not result:
-        data_results = data.get("data", {}).get("results", [])
-        if data_results:
-            parts = []
-            for item in data_results[:5]:
-                title = item.get("title", "")
-                url = item.get("url", "")
-                snippet = item.get("snippet", "") or item.get("content", "")
-                if snippet:
-                    parts.append(f"【{title}】{snippet}" + (f"（来源：{url}）" if url else ""))
-            result = "\n".join(parts)
-            logger.info(f"[web_search] 从 data.results 提取到 {len(data_results)} 条结果")
+    if not items and data.get("result"):
+        items.append({"title": "", "url": "", "content": str(data["result"]), "date": ""})
+    if not items and data.get("choices"):
+        items.append({"title": "", "url": "", "content": data["choices"][0].get("message", {}).get("content", ""), "date": ""})
 
-    if not result:
-        result = data.get("result", "") or data.get("content", "")
+    if not items:
+        logger.warning(f"[web_search] 未能解析响应: {json.dumps(data, ensure_ascii=False)[:300]}")
 
-    if not result:
-        choices = data.get("choices", [])
-        if choices:
-            result = choices[0].get("message", {}).get("content", "")
-            logger.info(f"[web_search] 从 choices[0].message.content 提取结果，长度: {len(result)}")
+    return items
 
-    if not result:
-        logger.warning(f"[web_search] 未能解析响应，完整响应: {json.dumps(data, ensure_ascii=False)[:500]}")
 
+def _clean_and_rerank(items: list[dict], query: str) -> list[dict]:
+    """清洗、去重、相关性排序。"""
+    # 1. 清洗每条的 HTML 和噪声
+    for item in items:
+        item["content"] = _clean_text(item["content"])
+        item["title"] = _clean_text(item["title"])
+
+    # 2. 去重（相似度 > 80% 的只保留第一条）
+    deduped = _deduplicate(items)
+
+    # 3. 计算相关性分数并排序
+    query_terms = _tokenize(query)
+    for item in deduped:
+        item["score"] = _relevance_score(item, query_terms)
+
+    # 4. 过滤低分结果 + 排序 + 截断
+    ranked = [it for it in deduped if it["score"] >= MIN_RELEVANCE_SCORE]
+    ranked.sort(key=lambda x: x["score"], reverse=True)
+
+    logger.info(
+        f"[web_search] 清洗: {len(items)}→去重{len(deduped)}→"
+        f"排序后Top{min(MAX_RESULTS, len(ranked))}，"
+        f"分数范围: {[it['score'] for it in ranked[:MAX_RESULTS]]}"
+    )
+    return ranked[:MAX_RESULTS]
+
+
+def _format_results(items: list[dict]) -> str:
+    """格式化清洗后的结果为紧凑文本。"""
+    lines = []
+    for i, item in enumerate(items, 1):
+        title = item["title"] or "无标题"
+        content = item["content"][:MAX_SNIPPET_LEN]
+        url = item["url"]
+        url_hint = f"（{url}）" if url else ""
+        lines.append(f"[{i}] {title}\n{content}\n{url_hint}")
+    return "\n\n".join(lines)
+
+
+# ========== 清洗 Helper 函数 ==========
+
+_HTML_RE = re.compile(r"<[^>]+>")
+_WHITESPACE_RE = re.compile(r"\s+")
+_ENTITY_RE = re.compile(r"&[a-z]+;")
+
+
+def _clean_text(text: str) -> str:
+    """移除 HTML 标签、实体、多余空白。"""
+    text = _HTML_RE.sub(" ", text)
+    text = _ENTITY_RE.sub(" ", text)
+    text = _WHITESPACE_RE.sub(" ", text)
+    return text.strip()
+
+
+def _tokenize(text: str) -> set:
+    """简单分词：按非字母数字字符拆分，取长度≥2的词。"""
+    tokens = re.split(r"[^a-zA-Z0-9一-鿿]+", text.lower())
+    return {t for t in tokens if len(t) >= 2}
+
+
+def _relevance_score(item: dict, query_terms: set) -> int:
+    """计算条目与查询的相关性分数。"""
+    score = 0
+    title_lower = item["title"].lower()
+    content_lower = item["content"].lower()
+
+    for term in query_terms:
+        if term in title_lower:
+            score += 3       # 标题命中权重高
+        elif term in content_lower:
+            score += 1       # 正文命中权重低
+
+    # 内容长度惩罚：极短内容降分
+    if len(item["content"]) < 50:
+        score = max(0, score - 2)
+
+    # 如果有有效 URL 加分
+    if item.get("url") and item["url"].startswith("http"):
+        score += 1
+
+    return score
+
+
+def _deduplicate(items: list[dict]) -> list[dict]:
+    """去重：标题相似度 > 80% 或 URL 相同视为重复。"""
+    seen_urls = set()
+    result = []
+    for item in items:
+        url = item.get("url", "")
+        if url and url in seen_urls:
+            continue
+        if url:
+            seen_urls.add(url)
+
+        # 标题去重
+        title = item.get("title", "")
+        is_dup = False
+        for kept in result:
+            if _title_similarity(title, kept.get("title", "")) > 0.8:
+                is_dup = True
+                break
+        if not is_dup:
+            result.append(item)
     return result
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """简单 Jaccard 相似度。"""
+    if not a or not b:
+        return 0.0
+    set_a = _tokenize(a)
+    set_b = _tokenize(b)
+    if not set_a or not set_b:
+        return 0.0
+    return len(set_a & set_b) / len(set_a | set_b)
