@@ -17,3 +17,14 @@ class TaskResult(BaseModel):
     result: str
     findings: str = ""        # 写入黑板的发现
     outputs: Dict[str, Any] = {}
+
+    # ===== 新增字段：边界情况 & Replan 闭环 =====
+
+    # 任务状态机状态：pending / executing / succeeded / failed / retried / skipped
+    state: str = "pending"
+
+    # 内容质量评分 0-100，-1 表示未评估
+    quality_score: int = -1
+
+    # 评估器备注，记录质量不通过原因等
+    evaluator_notes: str = ""

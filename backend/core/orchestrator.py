@@ -32,6 +32,19 @@ from backend.core.memory_strategy import apply_memory_strategy
 from backend.core.validation_strategy import apply_validation_strategy, get_max_retries
 from backend.config.prompts import get_prompt_loader
 
+# 边界情况 & Replan 闭环模块
+from backend.core.task_status import (
+    OrchestratorState, TaskState,
+    can_transition, is_terminal, is_failed_state,
+)
+from backend.core.quality_checker import QualityChecker
+from backend.core.replan_evaluator import (
+    ReplanEvaluator, EvaluationVerdict, check_hard_replan_conditions,
+)
+from backend.core.config import (
+    MAX_REPLAN_LIMIT, QUALITY_THRESHOLD, MAX_TASK_RETRIES, ENABLE_QUALITY_CHECK,
+)
+
 # 一个简单的正则表达式，用于从消息内容中匹配 @agent_id
 MENTION_REGEX = r'@(\w+)'
 WORKFLOW_TRIGGER_THRESHOLD = 6
@@ -86,7 +99,34 @@ class Orchestrator:
         self.planning_graph_builder = self._build_planning_graph()
         # 5. 最后加载数据库里的自定义Agent
         self._load_custom_agents_from_db()
+        # 6. 初始化边界情况 & Replan 闭环模块
+        self._init_boundary_modules()
         logger.info("✅ Orchestrator 初始化完成，所有组件加载成功。")
+
+    def _init_boundary_modules(self):
+        """初始化边界情况 & Replan 闭环模块（QualityChecker + ReplanEvaluator）。"""
+        try:
+            llm_backend = self.get_backend("tongyi")
+            async def _llm_invoke(messages):
+                return await llm_backend.chat(messages)
+            self.quality_checker = QualityChecker(
+                llm_invoke=_llm_invoke if ENABLE_QUALITY_CHECK else None,
+                quality_threshold=QUALITY_THRESHOLD,
+                enable=ENABLE_QUALITY_CHECK,
+            )
+            self.replan_evaluator = ReplanEvaluator(
+                llm_invoke=_llm_invoke,
+                prompt_loader=self.prompt_loader,
+            )
+            logger.info(
+                f"✅ 边界模块已初始化: quality_checker={'enabled' if ENABLE_QUALITY_CHECK else 'disabled'}, "
+                f"replan_evaluator=enabled, max_replan={MAX_REPLAN_LIMIT}, "
+                f"quality_threshold={QUALITY_THRESHOLD}, max_task_retries={MAX_TASK_RETRIES}"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ 边界模块初始化失败（非致命，降级运行）: {e}")
+            self.quality_checker = None
+            self.replan_evaluator = None
 
     def _setup_backends(self):
         """
@@ -1664,10 +1704,16 @@ class Orchestrator:
         step_results = {}
         # 初始化 Agent 中间输出列表，用于前端展示依次回复
         agent_outputs = state.get("agent_outputs", [])
-        
+        # 初始化任务状态和质量报告跟踪
+        task_states = state.get("task_states", {})
+        quality_reports = state.get("quality_reports", {})
+
         if not tasks:
             logger.warning("没有可执行的子任务")
-            return {**state, "step_results": step_results, "agent_outputs": agent_outputs}
+            return {
+                **state, "step_results": step_results, "agent_outputs": agent_outputs,
+                "task_states": task_states, "quality_reports": quality_reports,
+            }
             
         # 分离有依赖的任务和可并行的独立任务
         parallel_tasks = []
@@ -1686,42 +1732,57 @@ class Orchestrator:
             semaphore = asyncio.Semaphore(3)  # 限制 LLM 并发数，避免触发 rate limit
 
             async def run_async_task(task):
-                """使用统一入口并发执行任务，自动走 ReAct 或降级"""
+                """使用统一入口并发执行任务，带重试循环和质量检查"""
                 async with semaphore:
                     agent_id = getattr(task, "agent_id")
                     prompt = getattr(task, "prompt", getattr(task, "description", ""))
                     agent = self.get_agent(agent_id)
                     if not agent:
-                        return {"step_id": task.step_id, "result": f"错误：找不到Agent {agent_id}"}
-                    try:
-                        prog_q = getattr(self, '_progressive_queue', None)
-                        if prog_q is not None:
-                            prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "thinking"})
-                        skills_prompt = self.get_available_skills_prompt()
-                        workspace = state.get("shared_workspace", {})
-                        workspace_context = "\n=== 之前任务的关键发现（黑板上下文） ===\n"
-                        if workspace:
-                            for key, value in workspace.items():
-                                workspace_context += f"- {key}: {str(value)[:300]}...\n"
-                        else:
-                            workspace_context += "暂无前置任务的共享上下文\n"
-                        runtime_context = f"=== 执行上下文 ===\n- conversation_id: {state.get('conversation_id')}\n- current_user_id: {state.get('current_user_id') or 'unknown'}"
-                        full_prompt = f"{skills_prompt}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}"
+                        return {
+                            "step_id": task.step_id, "result": f"错误：找不到Agent {agent_id}",
+                            "state": TaskState.FAILED, "quality": None,
+                        }
 
-                        output_text = await self._call_agent_with_tools(
-                            agent=agent,
-                            prompt=full_prompt,
-                            conversation_id=state.get("conversation_id")
-                        )
-                        if prog_q is not None:
-                            prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "done"})
-                        logger.info(f"✅ 子任务{task.step_id}执行成功，Agent: {agent_id}")
-                        return {"step_id": task.step_id, "result": output_text}
-                    except Exception as e:
-                        if prog_q is not None:
-                            prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "done"})
-                        logger.error(f"❌ 子任务{task.step_id}执行失败: {e}")
-                        return {"step_id": task.step_id, "result": f"执行失败: {str(e)}"}
+                    prog_q = getattr(self, '_progressive_queue', None)
+                    if prog_q is not None:
+                        prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "thinking"})
+
+                    skills_prompt = self.get_available_skills_prompt()
+                    workspace = state.get("shared_workspace", {})
+                    workspace_context = "\n=== 之前任务的关键发现（黑板上下文） ===\n"
+                    if workspace:
+                        for key, value in workspace.items():
+                            workspace_context += f"- {key}: {str(value)[:300]}...\n"
+                    else:
+                        workspace_context += "暂无前置任务的共享上下文\n"
+                    runtime_context = f"=== 执行上下文 ===\n- conversation_id: {state.get('conversation_id')}\n- current_user_id: {state.get('current_user_id') or 'unknown'}"
+
+                    # 添加用户启用的技能注入
+                    active_skills_injection = ""
+                    active_skills_list = getattr(self, '_active_skills', None)
+                    if active_skills_list:
+                        active_skills_injection = self.get_active_skills_injection(active_skills_list)
+
+                    full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}"
+
+                    # 使用重试+质量检查辅助方法
+                    result_text, task_state, quality = await self._execute_single_task_with_retry(
+                        task=task,
+                        base_prompt=full_prompt,
+                        state=state,
+                        conversation_id=state.get("conversation_id"),
+                    )
+
+                    if prog_q is not None:
+                        prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "done"})
+
+                    return {
+                        "step_id": task.step_id,
+                        "result": result_text,
+                        "state": task_state,
+                        "quality": quality,
+                        "agent_id": agent_id,
+                    }
 
             # 使用 asyncio.gather 并发执行所有独立任务，共享同一个事件循环
             parallel_results = await asyncio.gather(
@@ -1735,14 +1796,22 @@ class Orchestrator:
                     logger.error(f"❌ 并行任务异常: {r}")
                     continue
                 if isinstance(r, dict) and "step_id" in r:
-                    step_results[r["step_id"]] = r["result"]
+                    step_id = r["step_id"]
+                    step_results[step_id] = r["result"]
+                    # 跟踪任务状态
+                    task_state = r.get("state", TaskState.SUCCEEDED)
+                    task_states[step_id] = task_state
+                    # 跟踪质量报告
+                    quality = r.get("quality")
+                    if quality:
+                        quality_reports[step_id] = quality
                     # 黑板机制：将当前任务结果写入shared_workspace
-                    task_info = next((t for t in parallel_tasks if t.step_id == r["step_id"]), None)
+                    task_info = next((t for t in parallel_tasks if t.step_id == step_id), None)
                     if task_info:
                         current_workspace = state.get("shared_workspace", {})
-                        current_workspace[f"task_{r['step_id']}_output"] = r["result"]
+                        current_workspace[f"task_{step_id}_output"] = r["result"]
                         state["shared_workspace"] = current_workspace
-                    agent_id = getattr(task_info, "agent_id", "agent") if task_info else "agent"
+                    agent_id = r.get("agent_id") or (getattr(task_info, "agent_id", "agent") if task_info else "agent")
                     # 收集 Agent 输出（用于前端展示依次回复）
                     artifacts = self._parse_artifacts(r["result"])
                     agent_outputs.append({
@@ -1750,7 +1819,7 @@ class Orchestrator:
                         "content": r["result"],
                         "artifacts": artifacts,
                     })
-                    # 实时推送 artifact 到 SSE 队列（用 self._progressive_queue，不走 state 避免 msgpack 序列化）
+                    # 实时推送 artifact 到 SSE 队列
                     prog_q = getattr(self, '_progressive_queue', None)
                     if prog_q is not None:
                         for art in artifacts:
@@ -1769,86 +1838,202 @@ class Orchestrator:
                         conv_service.add_message_to_conversation(
                             conversation_id=int(conv_id),
                             agent_id=agent_id,
-                            content=f"📝 任务{r['step_id']}完成：\n{r['result']}"
+                            content=f"📝 任务{step_id}完成：\n{r['result']}"
                         )
-                    logger.info(f"📤 子任务{r['step_id']}完成，结果：{r['result'][:100]}...")
+                    status_icon = "✅" if task_state in (TaskState.SUCCEEDED, TaskState.RETRIED) else "❌"
+                    logger.info(f"📤 子任务{step_id}完成({task_state})，结果：{r['result'][:100]}...")
                 
         # 再执行顺序任务（简化处理，真实场景可做拓扑排序）
         for task in sequential_tasks:
             agent_id = getattr(task, "agent_id")
             prompt = getattr(task, "prompt", getattr(task, "description", ""))
             agent = self.get_agent(agent_id)
-            if agent:
-                try:
-                    prog_q = getattr(self, '_progressive_queue', None)
-                    if prog_q is not None:
-                        prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "thinking"})
-                    # 🔧 黑板机制：从shared_workspace注入上下文到prompt
-                    workspace = state.get("shared_workspace", {})
-                    workspace_context = "\n=== 之前任务的关键发现（黑板上下文） ===\n"
-                    if workspace:
-                        for key, value in workspace.items():
-                            # 只取前300字，避免prompt过长
-                            workspace_context += f"- {key}: {str(value)[:300]}...\n"
-                    else:
-                        workspace_context += "暂无前置任务的共享上下文\n"
+            if not agent:
+                step_results[task.step_id] = f"错误：找不到Agent {agent_id}"
+                task_states[task.step_id] = TaskState.FAILED
+                quality_reports[task.step_id] = {
+                    "task_id": task.step_id, "passed": False, "score": 0,
+                    "reasons": [f"Agent {agent_id} 未注册"], "strategy": "rules",
+                }
+                continue
 
-                    # 合并技能列表、黑板上下文和当前任务prompt
-                    skills_prompt = self.get_available_skills_prompt()
-                    runtime_context = f"=== 执行上下文 ===\n- conversation_id: {state.get('conversation_id')}\n- current_user_id: {state.get('current_user_id') or 'unknown'}"
-                    full_prompt = f"{skills_prompt}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}"
+            prog_q = getattr(self, '_progressive_queue', None)
+            if prog_q is not None:
+                prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "thinking"})
 
-                    output_text = await self._call_agent_with_tools(
-                        agent=agent,
-                        prompt=full_prompt,
-                        conversation_id=state.get("conversation_id")
-                    )
-                    if prog_q is not None:
-                        prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "done"})
+            # 🔧 黑板机制：从shared_workspace注入上下文到prompt
+            workspace = state.get("shared_workspace", {})
+            workspace_context = "\n=== 之前任务的关键发现（黑板上下文） ===\n"
+            if workspace:
+                for key, value in workspace.items():
+                    workspace_context += f"- {key}: {str(value)[:300]}...\n"
+            else:
+                workspace_context += "暂无前置任务的共享上下文\n"
 
-                    step_results[task.step_id] = output_text
-                    # 🔧 黑板机制：将当前任务结果写入shared_workspace
-                    current_workspace = state.get("shared_workspace", {})
-                    current_workspace[f"task_{task.step_id}_output"] = output_text
-                    state["shared_workspace"] = current_workspace
-                    logger.info(f"✅ 顺序子任务{task.step_id}执行成功，Agent: {agent_id}")
-                    # 顺序子任务完成后也实时保存到数据库
-                    conv_id = state.get("conversation_id")
-                    if conv_id and self.db_session:
-                        from backend.services.conversation_service import ConversationService
-                        conv_service = ConversationService(self.db_session)
-                        conv_service.add_message_to_conversation(
-                            conversation_id=int(conv_id),
-                            agent_id=getattr(task, "agent_id", "agent"),
-                            content=f"📝 顺序任务{task.step_id}完成：\n{output_text}"
-                        )
-                        logger.info(f"💾 顺序子任务{task.step_id}的消息已写入数据库，Agent: {getattr(task, 'agent_id', 'agent')}")
-                    # 收集 Agent 输出（用于前端展示依次回复）
-                    artifacts = self._parse_artifacts(output_text)
-                    agent_outputs.append({
+            # 合并技能列表、黑板上下文和当前任务prompt
+            skills_prompt = self.get_available_skills_prompt()
+            runtime_context = f"=== 执行上下文 ===\n- conversation_id: {state.get('conversation_id')}\n- current_user_id: {state.get('current_user_id') or 'unknown'}"
+
+            # 添加用户启用的技能注入
+            active_skills_injection = ""
+            active_skills_list = getattr(self, '_active_skills', None)
+            if active_skills_list:
+                active_skills_injection = self.get_active_skills_injection(active_skills_list)
+
+            full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}"
+
+            # 使用重试+质量检查辅助方法
+            result_text, task_state, quality = await self._execute_single_task_with_retry(
+                task=task,
+                base_prompt=full_prompt,
+                state=state,
+                conversation_id=state.get("conversation_id"),
+            )
+
+            if prog_q is not None:
+                prog_q.put_nowait({"type": "thinking", "agent_id": agent_id, "status": "done"})
+
+            step_results[task.step_id] = result_text
+            task_states[task.step_id] = task_state
+            if quality:
+                quality_reports[task.step_id] = quality
+
+            # 🔧 黑板机制：将当前任务结果写入shared_workspace
+            current_workspace = state.get("shared_workspace", {})
+            current_workspace[f"task_{task.step_id}_output"] = result_text
+            state["shared_workspace"] = current_workspace
+
+            # 顺序子任务完成后也实时保存到数据库
+            conv_id = state.get("conversation_id")
+            if conv_id and self.db_session:
+                from backend.services.conversation_service import ConversationService
+                conv_service = ConversationService(self.db_session)
+                conv_service.add_message_to_conversation(
+                    conversation_id=int(conv_id),
+                    agent_id=agent_id,
+                    content=f"📝 顺序任务{task.step_id}完成：\n{result_text}"
+                )
+
+            # 收集 Agent 输出
+            artifacts = self._parse_artifacts(result_text)
+            agent_outputs.append({
+                "agent_id": agent_id,
+                "content": result_text,
+                "artifacts": artifacts,
+            })
+            # 实时推送 artifact 到 SSE 队列
+            prog_q = getattr(self, '_progressive_queue', None)
+            if prog_q is not None:
+                for art in artifacts:
+                    prog_q.put_nowait({
                         "agent_id": agent_id,
-                        "content": output_text,
-                        "artifacts": artifacts,
+                        "type": art.get("type", "code"),
+                        "title": art.get("title", "代码"),
+                        "content": art.get("content", ""),
+                        "artifacts": [art],
                     })
-                    # 实时推送 artifact 到 SSE 队列（用 self._progressive_queue，不走 state 避免 msgpack 序列化）
-                    prog_q = getattr(self, '_progressive_queue', None)
-                    if prog_q is not None:
-                        for art in artifacts:
-                            prog_q.put_nowait({
-                                "agent_id": agent_id,
-                                "type": art.get("type", "code"),
-                                "title": art.get("title", "代码"),
-                                "content": art.get("content", ""),
-                                "artifacts": [art],
-                            })
-                    logger.info(f"📤 顺序子任务{task.step_id}完成，结果：{output_text[:100]}...")
-                except Exception as e:
-                    step_results[task.step_id] = f"执行失败: {str(e)}"
-                    logger.error(f"❌ 顺序子任务{task.step_id}执行失败: {e}")
+            status_icon = "✅" if task_state in (TaskState.SUCCEEDED, TaskState.RETRIED) else "❌"
+            logger.info(f"📤 顺序子任务{task.step_id}完成({task_state})，结果：{result_text[:100]}...")
 
         logger.info(f"🎉 所有子任务执行完成，共{len(step_results)}个结果")
-        return {**state, "step_results": step_results, "agent_outputs": agent_outputs}
-        
+        return {
+            **state,
+            "step_results": step_results,
+            "agent_outputs": agent_outputs,
+            "task_states": task_states,
+            "quality_reports": quality_reports,
+            "orchestrator_state": OrchestratorState.RUNNING,
+        }
+
+    async def _execute_single_task_with_retry(
+        self, task, base_prompt: str, state: GraphState, conversation_id: str
+    ) -> tuple:
+        """
+        执行单个子任务，带重试循环和质量检查。
+
+        Returns:
+            (result_text, task_state, quality_report_dict_or_None)
+        """
+        agent_id = getattr(task, "agent_id")
+        agent = self.get_agent(agent_id)
+        if not agent:
+            return f"错误：找不到Agent {agent_id}", TaskState.FAILED, {
+                "task_id": task.step_id, "passed": False, "score": 0,
+                "reasons": [f"Agent {agent_id} 未注册"], "strategy": "rules",
+            }
+
+        max_retries = getattr(task, "max_retries", 1)
+        if max_retries < 1:
+            max_retries = 1
+
+        last_result = ""
+        last_quality = None
+        current_prompt = base_prompt
+
+        for attempt in range(max_retries + 1):
+            try:
+                output_text = await self._call_agent_with_tools(
+                    agent=agent,
+                    prompt=current_prompt,
+                    conversation_id=conversation_id,
+                    active_skills=getattr(self, '_active_skills', None),
+                    current_user_id=state.get("current_user_id"),
+                    current_user_name=state.get("current_user_name", "unknown"),
+                )
+                last_result = output_text
+
+                # 质量检查
+                quality = None
+                if self.quality_checker:
+                    expected_fmt = getattr(task, "output_format", "自然语言")
+                    task_prompt = getattr(task, "prompt", "")
+                    quality = await self.quality_checker.assess(
+                        task_id=task.step_id,
+                        result=output_text,
+                        task_prompt=task_prompt,
+                        expected_format=expected_fmt,
+                    )
+                    last_quality = {
+                        "task_id": task.step_id,
+                        "passed": quality.passed,
+                        "score": quality.score,
+                        "reasons": quality.reasons,
+                        "strategy": quality.strategy,
+                    }
+
+                if quality is None or quality.passed:
+                    state_label = TaskState.SUCCEEDED if attempt == 0 else TaskState.RETRIED
+                    logger.info(
+                        f"✅ 子任务{task.step_id}执行成功 (attempt={attempt+1}/{max_retries+1}, "
+                        f"quality={'passed' if quality and quality.passed else 'unchecked'})"
+                    )
+                    return output_text, state_label, last_quality
+
+                # 质量不通过，准备重试
+                if attempt < max_retries:
+                    retry_hint = f"\n\n[重试提示] 第{attempt+1}次结果质量不通过：{quality.reason_text}\n请改进后重新作答。"
+                    current_prompt = base_prompt + retry_hint
+                    logger.info(
+                        f"🔄 子任务{task.step_id}质量不通过，重试 attempt={attempt+1}/{max_retries+1}: "
+                        f"score={quality.score}, reasons={quality.reasons}"
+                    )
+
+            except Exception as e:
+                last_result = f"执行失败: {str(e)}"
+                if attempt < max_retries:
+                    logger.warning(f"🔄 子任务{task.step_id}异常，重试 attempt={attempt+1}/{max_retries+1}: {e}")
+                    continue
+                logger.error(f"❌ 子任务{task.step_id}重试耗尽，最终失败: {e}")
+
+        # 所有重试耗尽
+        final_state = TaskState.RETRIED
+        if last_quality is None:
+            last_quality = {
+                "task_id": task.step_id, "passed": False, "score": 0,
+                "reasons": [f"所有{max_retries+1}次尝试均失败"], "strategy": "rules",
+            }
+        return last_result, final_state, last_quality
+
     async def _generate_summary_node(self, state: GraphState) -> Dict[str, Any]:
         """
         汇总所有子任务的执行结果，生成最终的总结报告返回给用户
@@ -2311,130 +2496,353 @@ class Orchestrator:
         return conversation_id
 
     async def _evaluate_results_node(self, state: GraphState) -> Dict[str, Any]:
-        """评估所有子任务的结果，判断是否需要重规划"""
-        logger.info("--- [PlanningWorkflow] 评估子任务结果 ---")
+        """
+        评估所有子任务的结果，判断是否需要重规划。
+
+        两阶段评估：
+        1. 纯规则判断（任务计数 + 质量报告）
+        2. 独立 ReplanEvaluator LLM 评估（仅在有模糊情况时调用）
+
+        评估与规划解耦：本节点只负责判断状态，不直接生成新计划。
+        新计划由 PlannerAgent 在得到 replan_context 后生成。
+        """
+        logger.info("--- [PlanningWorkflow] 评估子任务结果（两阶段评估） ---")
         tasks = state.get("plan_data", {}).get("tasks", [])
         step_results = state.get("step_results", {})
-        workspace = state.get("shared_workspace", {})
         task_content = state.get("task_content", "")
+        task_states = state.get("task_states", {})
+        quality_reports = state.get("quality_reports", {})
 
         if not tasks:
-            return {**state, "final_summary": "无任务可评估"}
+            return {**state, "final_summary": "无任务可评估", "orchestrator_state": OrchestratorState.SUCCESS}
 
-        # 构造评估 prompt
-        tasks_summary = []
+        # ===== 第一阶段：纯规则判断 =====
+
+        # 统计任务完成情况（结合 task_states 和 quality_reports）
+        succeeded_tasks = []
+        failed_task_ids = []
         for task in tasks:
-            res = step_results.get(task.step_id, "")
-            if isinstance(res, dict):
-                status = res.get('status', '未知')
-                result = res.get('result', '')[:200]
+            sid = task.step_id
+            ts = task_states.get(sid, "")
+            qr = quality_reports.get(sid, {})
+            # 判断成功：state 为 succeeded 或 retried，且质量通过
+            if ts in (TaskState.SUCCEEDED, TaskState.RETRIED):
+                if qr and isinstance(qr, dict) and not qr.get("passed", True):
+                    # 质量不通过但被标记为成功 → 归类为失败
+                    failed_task_ids.append(sid)
+                else:
+                    succeeded_tasks.append(sid)
+            elif ts == TaskState.FAILED:
+                failed_task_ids.append(sid)
             else:
-                status = '完成'
-                result = str(res)[:200]
-            tasks_summary.append(
-                f"步骤{task.step_id} ({task.agent_id}): 状态={status}, "
-                f"结果摘要={result}"
+                # 无 task_state 的旧数据兼容：检查 step_results
+                res = step_results.get(sid, "")
+                if not res or (isinstance(res, dict) and res.get("status") == "failed"):
+                    failed_task_ids.append(sid)
+                elif isinstance(res, str) and (res.startswith("执行失败") or res.startswith("错误：")):
+                    failed_task_ids.append(sid)
+                else:
+                    succeeded_tasks.append(sid)
+
+        total = len(tasks)
+        succeeded_count = len(succeeded_tasks)
+        failed_count = len(failed_task_ids)
+
+        logger.info(
+            f"[EVALUATE] 任务完成情况: 总数={total}, 成功={succeeded_count}, "
+            f"失败={failed_count}, failed_ids={failed_task_ids}"
+        )
+
+        # 快速路径：全部成功 → 直接完成
+        if succeeded_count == total and failed_count == 0:
+            logger.info(f"[EVALUATE] 所有 {total} 个任务成功，直接结束")
+            return {
+                **state,
+                "final_summary": "所有任务完成",
+                "orchestrator_state": OrchestratorState.SUCCESS,
+            }
+
+        plan_iteration = state.get("plan_iteration", 0)
+
+        # ===== 第二阶段：硬条件检查 =====
+        hard_verdict = check_hard_replan_conditions(
+            quality_reports=quality_reports,
+            task_states=task_states,
+            plan_iteration=plan_iteration,
+            max_replan_limit=MAX_REPLAN_LIMIT,
+            max_task_retries=MAX_TASK_RETRIES,
+        )
+
+        if hard_verdict:
+            logger.info(
+                f"[EVALUATE] 硬条件触发: action={hard_verdict.action}, "
+                f"reason={hard_verdict.reason}"
+            )
+            if hard_verdict.action == "degrade":
+                return await self._handle_degrade(state, hard_verdict.reason)
+            elif hard_verdict.action == "replan":
+                return await self._do_replan(state, succeeded_tasks, failed_task_ids)
+
+        # ===== 第三阶段：独立评估器 LLM 语义评估 =====
+        # 分类结果：valid_results / failed_tasks
+        valid_results = {}
+        failed_detail = {}
+        for sid in succeeded_tasks:
+            valid_results[sid] = step_results.get(sid, "")
+        for sid in failed_task_ids:
+            qr = quality_reports.get(sid, {})
+            if isinstance(qr, dict):
+                reason = qr.get("reasons", ["未知"])[0] if qr.get("reasons") else "未知"
+            else:
+                reason = "执行异常"
+            failed_detail[sid] = {
+                "result": str(step_results.get(sid, ""))[:200],
+                "reason": reason,
+                "retries": task_states.get(sid, ""),
+            }
+
+        if self.replan_evaluator:
+            verdict = await self.replan_evaluator.evaluate(
+                task_content=task_content,
+                valid_results=valid_results,
+                failed_tasks=failed_detail,
+                plan_iteration=plan_iteration,
+                max_replan_limit=MAX_REPLAN_LIMIT,
+            )
+            logger.info(
+                f"[EVALUATE] ReplanEvaluator 判定: action={verdict.action}, "
+                f"confidence={verdict.confidence:.2f}, reason={verdict.reason}"
+            )
+        else:
+            # 降级：无评估器时，有失败就 replan
+            verdict = EvaluationVerdict(
+                action="replan",
+                reason="评估器不可用，默认触发重规划",
+                confidence=0.5,
             )
 
-        prompt = self.prompt_loader.get('workflow', 'plan_evaluation',
-            task_content=task_content,
-            tasks_summary=chr(10).join(tasks_summary),
-            workspace=json.dumps(workspace, ensure_ascii=False)
-        )
-        # 调用 LLM
-        messages = [{"role": "user", "content": prompt}]
-        resp = await self.get_backend("tongyi").chat(messages)
-        if isinstance(resp, str):
-            content = resp
-        else:
-            content = resp.content.strip()
-
-        # 解析决策（增强：用正则提取JSON，和planner保持一致）
-        try:
-            # 使用正则表达式精确查找 JSON 代码块
-            match = re.search(r"```json\n(.*?)\n```", content, re.DOTALL)
-            if not match:
-                logger.warning("[PlanningWorkflow] 响应中未找到```json代码块，尝试直接解析")
-                json_str = content.strip()
-            else:
-                logger.info("[PlanningWorkflow] 在评估响应中成功匹配到JSON代码块")
-                json_str = match.group(1).strip()
-            
-            decision = json.loads(json_str)
-            logger.info(f"[PlanningWorkflow] 评估节点解析成功，决策: {decision.get('decision', 'unknown')}")
-        except json.JSONDecodeError as e:
-            # 降级：如果解析失败，认为完成
-            logger.error(f"[PlanningWorkflow] 评估节点JSON解析失败: {e}，原始内容: {content[:500]}")
-            return {**state, "final_summary": "任务执行完成（评估降级）"}
-
-        if decision.get("decision") == "complete":
-            return {**state, "final_summary": "所有任务完成"}
-        elif decision.get("decision") == "replan":
-            new_tasks_raw = decision.get("new_tasks", [])
-            # 处理LLM返回的不规则字段，映射为TaskSpec要求的格式
-            FIELD_ALIASES = {
-                'step_id': ['id'],
-                'agent_id': ['role', 'agent', 'assigned_to', 'executor'],
-                'prompt': ['description', 'task', 'instruction', 'content'],
-                'dependencies': ['depends_on', 'depends', 'prerequisites'],
+        # 根据评估结论分发
+        if verdict.action == "complete":
+            return {
+                **state,
+                "final_summary": f"任务执行完成（{succeeded_count}/{total}成功）",
+                "orchestrator_state": OrchestratorState.SUCCESS,
             }
-            normalized_tasks = []
-            for t in new_tasks_raw:
-                normalized = {}
-                # 正向别名映射：如果 LLM 用了别名，映射到标准字段
-                for std_field, aliases in FIELD_ALIASES.items():
-                    for alias in aliases:
-                        if alias in t and std_field not in t:
-                            normalized[std_field] = t.pop(alias)
-                            break
-                    if std_field in t:
-                        normalized[std_field] = t[std_field]
-                # 补全剩余未映射的字段
-                for k, v in t.items():
-                    if k not in normalized:
-                        normalized[k] = v
-                # 如果仍缺少 prompt，用 description 兜底
-                if 'prompt' not in normalized:
-                    normalized['prompt'] = normalized.get('description', '执行修复任务')
-                normalized.pop('description', None)
-                # 如果仍缺少 agent_id，挑一个最像的字段或直接设默认值
-                if 'agent_id' not in normalized:
-                    candidates = [v for k, v in normalized.items()
-                                  if k in ('assigned_to', 'executor', 'agent_name', 'executor_name',
-                                           'target', 'target_agent', 'agent_id')]
-                    if candidates:
-                        normalized['agent_id'] = candidates[0]
-                    else:
-                        normalized['agent_id'] = 'tongyi'
-                normalized_tasks.append(normalized)
-            
-            logger.info(f"[REPLAN] 原始 new_tasks={json.dumps(decision.get('new_tasks', []), ensure_ascii=False)[:500]}")
-            logger.info(f"[REPLAN] 归一化后 tasks={json.dumps(normalized_tasks, ensure_ascii=False)[:500]}")
+        elif verdict.action == "degrade":
+            return await self._handle_degrade(state, verdict.reason)
+        elif verdict.action == "replan":
+            return await self._do_replan(state, succeeded_tasks, failed_task_ids)
+        elif verdict.action == "retry":
+            # 标记失败任务为 pending，重新进入 execute_tasks
+            logger.info(f"[EVALUATE] 评估器建议重试失败任务: {failed_task_ids}")
+            new_task_states = dict(task_states)
+            for sid in failed_task_ids:
+                new_task_states[sid] = TaskState.PENDING
+            return {
+                **state,
+                "task_states": new_task_states,
+                "orchestrator_state": OrchestratorState.RETRY,
+            }
+        else:
+            # 未知 action → 直接总结
+            return {**state, "final_summary": "部分任务未完成，请检查结果"}
+
+    async def _do_replan(
+        self, state: GraphState, succeeded_tasks: list, failed_task_ids: list
+    ) -> Dict[str, Any]:
+        """
+        执行重规划：构建 replan_context，调用 LLM 生成新计划。
+
+        核心原则：
+        - 有效结果保留（succeeded_tasks），禁止重复执行
+        - 失败任务废弃（failed_task_ids），需重新设计
+        - replan_context 显式标注三类结果供 Planner 使用
+        """
+        task_content = state.get("task_content", "")
+        step_results = state.get("step_results", {})
+        tasks = state.get("plan_data", {}).get("tasks", [])
+        task_states = state.get("task_states", {})
+        quality_reports = state.get("quality_reports", {})
+
+        plan_iteration = state.get("plan_iteration", 0) + 1
+        if plan_iteration > MAX_REPLAN_LIMIT:
+            logger.warning(f"[REPLAN] 重规划次数超限 ({plan_iteration}/{MAX_REPLAN_LIMIT})，降级处理")
+            return await self._handle_degrade(
+                state, f"重规划次数超限({plan_iteration}/{MAX_REPLAN_LIMIT})"
+            )
+
+        # 1. 分类三类结果
+        valid_results = {}
+        failed_detail = {}
+        discarded_ids = []
+
+        for task in tasks:
+            sid = task.step_id
+            if sid in succeeded_tasks:
+                valid_results[sid] = str(step_results.get(sid, ""))[:300]
+            elif sid in failed_task_ids:
+                qr = quality_reports.get(sid, {})
+                if isinstance(qr, dict):
+                    reasons = qr.get("reasons", ["未知"])
+                else:
+                    reasons = ["未知"]
+                failed_detail[sid] = {
+                    "result": str(step_results.get(sid, ""))[:200],
+                    "reason": "; ".join(reasons) if reasons else "未知",
+                    "agent_id": getattr(task, "agent_id", "unknown"),
+                }
+            else:
+                # 不在成功列表也不在失败列表 → 废弃
+                discarded_ids.append(sid)
+                task_states[sid] = TaskState.SKIPPED
+
+        # 2. 构建 replan_context
+        replan_context = {
+            "valid_results": valid_results,
+            "failed_tasks": failed_detail,
+            "discarded_tasks": discarded_ids,
+        }
+
+        logger.info(
+            f"[REPLAN] 第{plan_iteration}次重规划: valid={len(valid_results)}, "
+            f"failed={len(failed_detail)}, discarded={len(discarded_ids)}"
+        )
+
+        # 3. 构建 replan prompt
+        valid_summary = "\n".join(
+            f"- 任务{sid}: {res[:150]}..." for sid, res in valid_results.items()
+        ) if valid_results else "（无）"
+
+        failed_summary = "\n".join(
+            f"- 任务{sid} (Agent: {info.get('agent_id', '?')}): {info.get('reason', '?')}"
+            for sid, info in failed_detail.items()
+        ) if failed_detail else "（无）"
+
+        discarded_summary = "\n".join(
+            f"- 任务{sid}（已废弃）" for sid in discarded_ids
+        ) if discarded_ids else "（无）"
+
+        available_agents = "\n".join(f"- {aid}" for aid in self.agents.keys())
+
+        replan_prompt = self.prompt_loader.get('workflow', 'replan_prompt',
+            task_content=task_content,
+            replan_count=str(plan_iteration),
+            max_replan_limit=str(MAX_REPLAN_LIMIT),
+            available_agents=available_agents,
+            valid_results=valid_summary,
+            failed_tasks=failed_summary,
+            discarded_tasks=discarded_summary,
+        )
+
+        # 4. 调用 LLM 生成新计划
+        try:
+            messages = [{"role": "user", "content": replan_prompt}]
+            resp = await self.get_backend("tongyi").chat(messages)
+            content = resp if isinstance(resp, str) else resp.content.strip()
+
+            match = re.search(r"```json\n(.*?)\n```", content, re.DOTALL)
+            json_str = match.group(1).strip() if match else content.strip()
+            decision = json.loads(json_str)
+
+            logger.info(f"[REPLAN] LLM 决策: {decision.get('decision', 'unknown')}, "
+                        f"rationale: {decision.get('rationale', '')[:100]}")
+
+            if decision.get("decision") == "degrade":
+                return await self._handle_degrade(
+                    state, decision.get("rationale", "LLM建议降级")
+                )
+
+            # 解析新任务
+            new_tasks_raw = decision.get("new_tasks", [])
+            normalized_tasks = self._normalize_task_fields(new_tasks_raw)
+
             try:
                 new_tasks = [TaskSpec(**t) for t in normalized_tasks]
             except Exception as e:
-                logger.error(f"[REPLAN] TaskSpec 校验失败: {e}，tasks={json.dumps(normalized_tasks, ensure_ascii=False)[:1000]}")
-                return {**state, "final_summary": "任务过于复杂，部分结果请参考历史。"}
-            # 增加规划次数
-            iteration = state.get("plan_iteration", 0) + 1
-            if iteration > 2:  # 最多重规划两次，避免死循环
-                logger.warning("重规划次数过多，强制结束")
-                return {**state, "final_summary": "任务过于复杂，部分结果请参考历史。"}
-            # 保留已成功的步骤结果，清空失败步骤结果
-            # 过滤成功的任务，兼容字符串类型的结果
+                logger.error(f"[REPLAN] TaskSpec 校验失败: {e}")
+                return await self._handle_degrade(state, f"新计划校验失败: {e}")
+
+            # 5. 保留有效结果，清空失败/废弃结果
             new_step_results = {}
-            for k, v in step_results.items():
-                if isinstance(v, dict) and v.get("status") == "success":
-                    new_step_results[k] = v
-                elif isinstance(v, str):
-                    # 字符串类型的结果也视为成功
-                    new_step_results[k] = v
+            for sid in succeeded_tasks:
+                if sid in step_results:
+                    new_step_results[sid] = step_results[sid]
+                    task_states[sid] = TaskState.SUCCEEDED
+            for sid in failed_task_ids:
+                task_states[sid] = TaskState.SKIPPED
+
+            logger.info(
+                f"[REPLAN] 重规划完成: 保留{len(new_step_results)}个结果, "
+                f"新计划{len(new_tasks)}个任务, 废弃{len(discarded_ids)}个旧任务"
+            )
+
             return {
                 **state,
                 "plan_data": {"tasks": new_tasks},
                 "step_results": new_step_results,
-                "plan_iteration": iteration
+                "plan_iteration": plan_iteration,
+                "task_states": task_states,
+                "replan_context": replan_context,
+                "orchestrator_state": OrchestratorState.REPLAN,
             }
-        else:  # continue 或其他
-            # 可能部分任务未成功但可继续，这里不做重规划，直接总结
-            return {**state, "final_summary": "部分任务未完成，请检查结果"}
+
+        except json.JSONDecodeError as e:
+            logger.error(f"[REPLAN] JSON 解析失败: {e}")
+            return await self._handle_degrade(state, f"重规划响应解析失败: {e}")
+        except Exception as e:
+            logger.error(f"[REPLAN] 重规划异常: {e}")
+            return await self._handle_degrade(state, f"重规划异常: {e}")
+
+    def _normalize_task_fields(self, raw_tasks: list) -> list:
+        """将 LLM 返回的不规则字段映射为 TaskSpec 标准字段。"""
+        FIELD_ALIASES = {
+            'step_id': ['id'],
+            'agent_id': ['role', 'agent', 'assigned_to', 'executor'],
+            'prompt': ['description', 'task', 'instruction', 'content'],
+            'dependencies': ['depends_on', 'depends', 'prerequisites'],
+        }
+        normalized_tasks = []
+        for t in raw_tasks:
+            normalized = {}
+            for std_field, aliases in FIELD_ALIASES.items():
+                for alias in aliases:
+                    if alias in t and std_field not in t:
+                        normalized[std_field] = t.pop(alias)
+                        break
+                if std_field in t:
+                    normalized[std_field] = t[std_field]
+            for k, v in t.items():
+                if k not in normalized:
+                    normalized[k] = v
+            if 'prompt' not in normalized:
+                normalized['prompt'] = normalized.get('description', '执行修复任务')
+            normalized.pop('description', None)
+            if 'agent_id' not in normalized:
+                normalized['agent_id'] = 'tongyi'
+            normalized_tasks.append(normalized)
+        return normalized_tasks
+
+    async def _handle_degrade(self, state: GraphState, reason: str) -> Dict[str, Any]:
+        """
+        降级执行：放弃复杂流程，直接用通用 LLM 回答用户原始问题。
+        """
+        task_content = state.get("task_content", "")
+        logger.warning(f"[DEGRADE] 触发降级: {reason}")
+
+        try:
+            fallback_prompt = self.prompt_loader.get('workflow', 'fallback',
+                task_content=task_content,
+            )
+            messages = [{"role": "user", "content": fallback_prompt}]
+            resp = await self.get_backend("tongyi").chat(messages)
+            fallback_answer = resp if isinstance(resp, str) else resp.content.strip()
+            summary = f"⚠️ 复杂流程已降级处理（原因：{reason}）\n\n{fallback_answer}"
+        except Exception as e:
+            logger.error(f"[DEGRADE] 降级回答生成失败: {e}")
+            summary = f"⚠️ 任务处理遇到问题：{reason}。请稍后重试或简化您的需求。"
+
+        return {
+            **state,
+            "final_summary": summary,
+            "orchestrator_state": OrchestratorState.DEGRADE,
+        }
