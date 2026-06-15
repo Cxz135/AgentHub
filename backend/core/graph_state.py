@@ -3,6 +3,17 @@ from backend.models.task_spec import TaskSpec
 from backend.models.task_spec import TaskResult
 from langchain_core.messages import BaseMessage
 
+# 注册自定义类型到 LangGraph msgpack 序列化，消除 "Deserializing unregistered type" 警告
+import langgraph.checkpoint.serde.jsonplus as jsonplus_serde
+from backend.core.task_status import TaskState, OrchestratorState
+
+try:
+    jsonplus_serde.allowed_msgpack_types.add(('backend.models.task_spec', 'TaskSpec'))
+    jsonplus_serde.allowed_msgpack_types.add(('backend.core.task_status', 'TaskState'))
+    jsonplus_serde.allowed_msgpack_types.add(('backend.core.task_status', 'OrchestratorState'))
+except Exception:
+    pass  # 如果 API 变化不阻塞启动
+
 
 class GraphState(TypedDict):
     """

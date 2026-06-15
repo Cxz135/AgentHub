@@ -1178,7 +1178,10 @@ class Orchestrator:
         # 2. 准备并执行工作流
         initial_state = GraphState(
             task_content=task_content, plan_data=plan_data, step_results={},
-            final_summary="", conversation_id=conversation_id, messages=[]
+            final_summary="", conversation_id=conversation_id, messages=[],
+            # 显式初始化所有状态字段，防止旧 checkpoint 数据污染
+            task_states={}, quality_reports={}, replan_context={},
+            orchestrator_state=OrchestratorState.RUNNING, plan_iteration=0,
         )
         initial_state["current_user_id"] = (request_context or {}).get("current_user_id")
 
