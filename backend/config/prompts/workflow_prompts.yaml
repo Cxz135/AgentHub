@@ -1,6 +1,6 @@
 workflow:
   plan_evaluation:
-    description: "任务规划评估prompt"
+    description: "任务规划评估prompt（仅用于评估，不再负责生成新计划）"
     prompt: |
       原始任务：{task_content}
 
@@ -11,14 +11,72 @@ workflow:
 
       请判断：
       1. 是否所有子任务都已成功？如果未全部成功，是否有可以补救的步骤？
-      2. 是否需要重新规划剩余任务？如果需要，请给出新的子任务列表（JSON数组，格式同前）。
-      3. 如果任务已全部完成且满足要求，返回 "complete"。
+      2. 如果任务已全部完成且满足要求，返回 "complete"。
+      3. 如果部分任务未完成但可继续，返回 "continue"。
 
       请以JSON格式返回：
       {{
-        "decision": "continue" | "replan" | "complete",
-        "new_tasks": [ ... ]  // 仅当 decision=replan 时提供
+        "decision": "continue" | "complete"
       }}
+
+  replan_prompt:
+    description: "重规划提示词 - 显式区分有效/失败/废弃结果，防止已完成任务被重复执行"
+    prompt: |
+      你是 Orchestrator 任务调度器，当前进入【重规划 Replan】状态。
+      禁止继续局部重试，必须基于现状重构任务流程。
+
+      # 全局约束
+      1. 严格以【原始任务目标】为最终导向
+      2. 复用所有【有效已完成结果】，禁止重新规划已完成任务
+      3. 仅针对【异常失败环节】重新设计任务步骤
+      4. 新方案步骤合理、粒度适中，避免过度拆分或步骤缺失
+      5. 若多次重规划仍无法解决，标记建议降级执行
+
+      # 基础信息
+      【原始任务目标】
+      {task_content}
+
+      【当前全局状态】
+      累计重规划次数：{replan_count} / {max_replan_limit}
+      可用 Agent 列表：{available_agents}
+
+      # 子任务明细（按节点划分）
+
+      ## ✅ 有效完成节点（结果全部保留，禁止重做）
+      {valid_results}
+
+      ## ❌ 异常失败节点（必须重构，不可照搬原方案）
+      {failed_tasks}
+
+      ## 🚫 已废弃旧节点（直接忽略，不要参考）
+      {discarded_tasks}
+
+      # 输出要求
+      请按以下固定 JSON 格式输出新规划，不要额外闲聊：
+
+      ```json
+      {{
+        "decision": "continue" | "degrade",
+        "rationale": "整体调整思路简述",
+        "new_tasks": [
+          {{
+            "step_id": "新步骤ID（避免与已保留节点的ID冲突）",
+            "agent_id": "分配的Agent ID",
+            "prompt": "具体指令（自包含）",
+            "expectations": {{"pass": "及格标准", "standard": "期望标准"}},
+            "output_format": "期望输出格式",
+            "max_retries": 2,
+            "dependencies": []
+          }}
+        ]
+      }}
+      ```
+
+      注意事项：
+      1. 新的 step_id 不要与有效完成节点的 ID 重复
+      2. 每个 prompt 必须自包含，但可引用黑板上下文
+      3. 如果所有失败都不可补救，decision 设为 "degrade"
+      4. dependencies 中引用的前置任务只能是本次新规划中的任务
 
   memory_compression:
     description: "记忆压缩prompt"

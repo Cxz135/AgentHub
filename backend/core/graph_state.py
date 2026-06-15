@@ -45,5 +45,21 @@ class GraphState(TypedDict):
     # 收集每个子 Agent 的执行结果，供前端展示 Agent 依次回复
     agent_outputs: List[Dict[str, str]]
 
-    # 收集每个子 Agent 的执行结果，供前端展示 Agent 依次回复
-    agent_outputs: List[Dict[str, str]]
+    # ===== 新增字段：边界情况 & Replan 闭环 =====
+
+    # 每个子任务的状态跟踪 {step_id: "succeeded" | "failed" | "retried" | "skipped"}
+    task_states: Dict[str, str]
+
+    # 重规划上下文：显式区分三类结果供 ReplanEvaluator 和 Planner 使用
+    # {
+    #   "valid_results": {step_id: result, ...},     # 保留+复用
+    #   "failed_tasks": {step_id: {result, reason}},  # 失败原因
+    #   "discarded_tasks": [step_id, ...]             # 废弃节点
+    # }
+    replan_context: Dict[str, Any]
+
+    # 每个子任务的质量评估报告 {step_id: {"passed": bool, "score": int, "reasons": [...]}}
+    quality_reports: Dict[str, Any]
+
+    # 全局编排状态 "idle" | "init" | "running" | "retry" | "replan" | "degrade" | "success" | "failed"
+    orchestrator_state: str
