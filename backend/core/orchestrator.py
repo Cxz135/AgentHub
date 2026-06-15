@@ -1911,9 +1911,6 @@ class Orchestrator:
                     agent=agent,
                     prompt=current_prompt,
                     conversation_id=conversation_id,
-                    active_skills=getattr(self, '_active_skills', None),
-                    current_user_id=state.get("current_user_id"),
-                    current_user_name=state.get("current_user_name", "unknown"),
                 )
                 last_result = output_text
 
