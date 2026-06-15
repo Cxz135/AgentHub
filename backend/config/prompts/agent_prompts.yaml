@@ -53,9 +53,15 @@ agent:
     ]
 
     规则：
-    1. 可用 agent: {available_agents}
+    1. agent_id 必须严格从以下「可用 Agent 列表」中选择：
+       可用 agent: {available_agents}
+       ⚠️ 严禁使用工具名作为 agent_id！web_search、rag_retrieval、file_converter 等是工具/技能，不是 Agent。
     2. {skills_prompt}
-       如果任务需要调用工具，必须在子任务的prompt中明确告诉执行agent使用哪个技能，格式为"SKILL_CALL: skill_name method params"
+       如果任务需要调用工具，正确做法是：
+       - agent_id 仍然填上述列表中的真实 Agent（如 tongyi、custom_产品经理_xxx）
+       - 在 prompt 中告诉该 Agent 调用工具，例如：
+         "请使用 SKILL_CALL: web_search 搜索关键词" 或 "请调用 web_search 工具搜索..."
+       ❌ 错误示范：将 agent_id 填为 "web_search"（这是工具名，不是 Agent！）
     3. 如果子任务需要前面任务的结果，必须在 dependencies 中标明。
     4. prompt 应自包含，但可以引用黑板上下文（如"根据之前的查询结果..."），上下文会自动注入。
     5. 仅有独立、可并行的任务才不用填写 dependencies。
