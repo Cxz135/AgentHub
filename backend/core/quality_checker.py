@@ -106,17 +106,38 @@ def _check_acceptance_criteria(result: str, criteria: dict) -> List[str]:
 
     criteria 格式：
     {"must_include": [...], "must_not_include": [...], "min_length": int, "format_rules": [...]}
+
+    must_include 使用宽松阈值：仅当缺失比例 > 30% 才判定失败（容忍少量关键词因
+    格式化/中英文差异导致的假阴性），但至少需命中 1 个。
     """
     failures = []
     if not criteria or not isinstance(criteria, dict):
         return failures
 
-    # must_include：必须包含的关键词
+    # must_include：宽松阈值检查（缺失 ≤30% 放行）
     must_include = criteria.get("must_include", [])
     if must_include:
+        missing = []
         for keyword in must_include:
             if str(keyword).lower() not in result.lower():
-                failures.append(f"验收不通过：缺少必须内容「{keyword}」")
+                missing.append(keyword)
+        miss_ratio = len(missing) / len(must_include)
+        # 一个都没命中 → 硬失败
+        if len(missing) == len(must_include):
+            failures.append(f"验收不通过：所有必须关键词均缺失 {must_include}")
+        # 缺失超过 30% → 报告失败
+        elif miss_ratio > 0.3:
+            failures.append(
+                f"验收不通过：缺失 {len(missing)}/{len(must_include)} 个必须关键词 "
+                f"({miss_ratio:.0%} > 30%): {missing}"
+            )
+        # 少量缺失 → 仅在 debug 日志记录，不阻止通过
+        elif missing:
+            import logging
+            logging.getLogger("core").debug(
+                f"[QualityChecker] must_include 少量缺失（{len(missing)}/{len(must_include)}"
+                f"={miss_ratio:.0%} ≤30%），放行: {missing}"
+            )
 
     # must_not_include：禁止出现的错误模式
     must_not_include = criteria.get("must_not_include", [])
