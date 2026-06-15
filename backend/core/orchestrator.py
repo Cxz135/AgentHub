@@ -1077,15 +1077,17 @@ class Orchestrator:
         if not task_content:
             return {"agent_id": "orchestrator", "content": "请输入需要规划的具体任务。"}
 
-        # 1. 手动调用 PlannerAgent 生成计划（如果尚未预生成）
-        if pre_generated_tasks:
-            tasks = pre_generated_tasks
-            logger.info(f"[PlanFirst] 使用预生成的 {len(tasks)} 个任务，跳过 Planner 调用")
-        else:
-            planner = self.get_agent("planner")
-            if not planner:
-                logger.error("内部错误：规划工作流需要 'planner' Agent，但未找到。")
-                return {"agent_id": "orchestrator", "content": "抱歉，系统配置错误，无法找到规划器。"}
+        # 1. 加载长期记忆（Plan-First 和 Planner 路径共用）
+        config = {"configurable": {"thread_id": conversation_id}}
+        latest_checkpoint = await checkpointer.aget(config)
+        historical_summary = ""
+        if latest_checkpoint:
+            if 'values' in latest_checkpoint:
+                historical_summary = latest_checkpoint['values'].get("memory_summary", "")
+                msg_count = len(latest_checkpoint['values'].get('messages', []))
+                logger.info(f"[MEMORY] 历史消息数: {msg_count}，历史摘要长度: {len(historical_summary)}")
+            else:
+                historical_summary = ""
 
         if pre_generated_tasks:
             # Plan-First 路径：跳过 Planner 调用，直接使用预生成的任务
@@ -1096,19 +1098,11 @@ class Orchestrator:
             ) for t in tasks]
             logger.info(f"[PlanFirst] 复用预生成的 {len(tasks)} 个任务")
         else:
-                # --- 长期记忆读取与 Planner 上下文准备 ---
-            historical_summary = ""
-            config = {"configurable": {"thread_id": conversation_id}}
-            latest_checkpoint = await checkpointer.aget(config)
-            if latest_checkpoint:
-                logger.info(f"[MEMORY] 为对话 {conversation_id} 加载了历史记忆。Checkpoint keys: {list(latest_checkpoint.keys())}")
-                # LangGraph checkpointer使用['values']而不是.channel_values
-                if 'values' in latest_checkpoint:
-                    historical_summary = latest_checkpoint['values'].get("memory_summary", "")
-                    msg_count = len(latest_checkpoint['values'].get('messages', []))
-                    logger.info(f"[MEMORY] 历史消息数: {msg_count}，历史摘要长度: {len(historical_summary)}")
-                else:
-                    historical_summary = ""
+            # Planner 路径：调用 PlannerAgent 生成计划
+            planner = self.get_agent("planner")
+            if not planner:
+                logger.error("内部错误：规划工作流需要 'planner' Agent，但未找到。")
+                return {"agent_id": "orchestrator", "content": "抱歉，系统配置错误，无法找到规划器。"}
 
             available_agents = [agent_id for agent_id in self.agents.keys() if agent_id not in ["planner", "summarizer"]]
             # 生成统一的技能列表，传给planner
