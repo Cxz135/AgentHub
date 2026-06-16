@@ -738,7 +738,7 @@ class Orchestrator:
             t_agent = _time.time()
             try:
                 if hasattr(attempt_agent, 'executor'):
-                    # 检测任务是否需要工具（prompt 是否引用了工具名或 SKILL_CALL）
+                    # 检测任务是否需要工具
                     _tool_keywords = [t.name for t in self.langchain_tools] + [
                         "SKILL_CALL", "web_search", "rag_retrieval",
                         "scan_vulnerabilities", "file_converter",
@@ -746,19 +746,22 @@ class Orchestrator:
                     _needs_tools = any(
                         kw.lower() in (prompt or "").lower() for kw in _tool_keywords
                     )
-                    # 根据任务类型注入不同的 ReAct 行为约束
-                    if _needs_tools:
-                        _react_hint = (
-                            "\n\n【工具使用约束】你最多调用工具 3 次。"
-                            "如果连续 2 次搜索返回空结果，必须停止搜索，"
-                            "直接基于已有知识输出 Final Answer。"
-                            "禁止用不同措辞重复搜索同一主题。"
+
+                    if not _needs_tools:
+                        # 纯生成任务（文档/代码/报告）：跳过 ReAct，直接走 process_message
+                        # ReAct 的迭代限制会导致长内容被截断，process_message 无此限制
+                        logger.info(
+                            f"🎯 {attempt_agent.agent_id} 纯生成任务，"
+                            f"跳过 ReAct 循环，直接调用 LLM（避免长输出截断）"
                         )
-                    else:
-                        _react_hint = (
-                            "\n\n【注意】这是代码/文档/大纲生成任务，一般不需要搜索工具。"
-                            "优先直接输出 Final Answer。如确需查资料，最多调用 1 次工具。"
-                        )
+                        break  # 跳出 fallback 循环，进入 process_message
+
+                    _react_hint = (
+                        "\n\n【工具使用约束】你最多调用工具 3 次。"
+                        "如果连续 2 次搜索返回空结果，必须停止搜索，"
+                        "直接基于已有知识输出 Final Answer。"
+                        "禁止用不同措辞重复搜索同一主题。"
+                    )
 
                     if prompt is None and messages:
                         lines = []
