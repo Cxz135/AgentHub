@@ -316,6 +316,12 @@ class Orchestrator:
             self.tool_skills["rag_retrieval"] = rag_retrieval
             from backend.utils.web_search import web_search
             self.tool_skills["web_search"] = web_search
+            # 长内容生成工具：先大纲、再正文，解决 ReAct 生成长文档被截断的问题
+            from backend.utils.generate_long_content import (
+                generate_long_content_async, set_llm_backend,
+            )
+            set_llm_backend(self.get_backend("tongyi"))
+            self.tool_skills["generate_long_content"] = generate_long_content_async
         except ImportError:
             pass
         try:
@@ -743,6 +749,7 @@ class Orchestrator:
                     _tool_keywords = [t.name for t in self.langchain_tools] + [
                         "SKILL_CALL", "web_search", "rag_retrieval",
                         "scan_vulnerabilities", "file_converter",
+                        "generate_long_content",
                     ]
                     _needs_tools = any(
                         kw.lower() in (prompt or "").lower() for kw in _tool_keywords

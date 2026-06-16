@@ -43,6 +43,34 @@ class LLMBackend(ABC):
         """统一的流式调用接口，前端可实现打字机效果。"""
         ...
 
+    def chat_sync(
+        self,
+        messages: List[Dict[str, str]],
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        **kwargs: Any
+    ) -> str:
+        """同步包装器，供 LangChain Tool 等同步上下文调用。"""
+        import asyncio
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 在已有事件循环中运行（如 Jupyter）
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run,
+                        self.chat(messages, temperature, max_tokens, **kwargs)
+                    )
+                    return future.result(timeout=300)
+            return loop.run_until_complete(
+                self.chat(messages, temperature, max_tokens, **kwargs)
+            )
+        except RuntimeError:
+            return asyncio.run(
+                self.chat(messages, temperature, max_tokens, **kwargs)
+            )
+
     def count_tokens(self, text: str) -> int:
         """估算 token 数"""
         return len(text)
