@@ -43,6 +43,7 @@ from backend.core.replan_evaluator import (
 from backend.core.plan_analyzer import analyze_plan_complexity, analyze_plan_detail
 from backend.core.config import (
     MAX_REPLAN_LIMIT, QUALITY_THRESHOLD, MAX_TASK_RETRIES, ENABLE_QUALITY_CHECK,
+    REACT_MAX_ITERATIONS,
 )
 from backend.core.artifact_parser import parse_artifacts, push_artifacts_to_queue
 
@@ -69,7 +70,7 @@ class Orchestrator:
             "deepseek": DeepSeekAdapter,
             "tongyi": TongyiAdapter,
         }
-        self.max_iterations = 10
+        self.max_iterations = REACT_MAX_ITERATIONS
         self.max_retries = 2
         # 保存数据库会话，用于实时写入子Agent的消息
         self.db_session = db_session
@@ -2329,12 +2330,18 @@ class Orchestrator:
                 react_prompt = ChatPromptTemplate.from_template(react_prompt_template)
                 from langchain.agents import create_react_agent
                 react_agent = create_react_agent(agent.llm, self.langchain_tools, react_prompt)
+                # 支持按 Agent 自定义 ReAct 步数上限，默认使用全局配置
+                _agent_max_iter = getattr(agent, 'react_max_iterations', None) or self.max_iterations
                 agent_executor = AgentExecutor(
                     agent=react_agent,
                     tools=self.langchain_tools,
                     verbose=False,
-                    max_iterations=3,
+                    max_iterations=_agent_max_iter,
                     handle_parsing_errors=True,
+                )
+                logger.info(
+                    f"✅ Agent '{agent.agent_id}' ReAct executor: "
+                    f"max_iterations={_agent_max_iter}, tools={len(self.langchain_tools)}"
                 )
                 # 为agent附加执行器
                 agent.executor = agent_executor
