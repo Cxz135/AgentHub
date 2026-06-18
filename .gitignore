@@ -77,6 +77,8 @@ pytest_debug.log
 *.db
 *.db-shm
 *.db-wal
+*.sqlite-shm
+*.sqlite-wal
 
 # Logs
 logs/
@@ -106,11 +108,10 @@ pyvenv.cfg
 
 
 # ==============================================
-# Node.js / Express 服务端相关 (组员的server目录)
+# Node.js / Express 服务端相关
 # ==============================================
-# Dependencies
 node_modules/
-server/
+
 # Build outputs
 build/
 dist/
@@ -153,20 +154,15 @@ jspm_packages/
 
 # Nuxt.js build / generate output
 .nuxt
-dist
 
 # Gatsby files
 .cache/
-# Comment in the public line in if your project uses Gatsby and not Next.js
-# https://nextjs.org/blog/next-9-1#public-directory-support
-# public
 
 # vuepress build output
 .vuepress/dist
 
 # vuepress v2.x temp and cache directory
 .temp
-.cache
 
 # Docusaurus cache and generated files
 .docusaurus
@@ -195,17 +191,6 @@ dist
 
 
 # ==============================================
-# 项目特定的数据库文件
-# ==============================================
-# SQLite数据库文件（组员的server/data.sqlite等）
-*/server/data.sqlite
-*/server/data.sqlite-shm
-*/server/data.sqlite-wal
-*/backend/*.db
-*/backend/*.sqlite
-
-
-# ==============================================
 # 操作系统生成的文件
 # ==============================================
 .DS_Store
@@ -228,6 +213,7 @@ Thumbs.db
 *.orig
 *.rej
 
+
 # ==============================================
 # 本地配置文件
 # ==============================================
@@ -235,11 +221,6 @@ config_local.py
 settings_local.py
 local_settings.py
 
-# ==============================================
-# 代理文件
-# ==============================================
-*proxy.txt
-*proxy.json
 
 # ==============================================
 # 密钥和证书
@@ -250,38 +231,26 @@ local_settings.py
 *.p12
 *.pfx
 *secret*.json
-*token*.json# Dependencies
-node_modules/
+*token*.json
 
-# SQLite runtime files
-*.sqlite
-*.sqlite-shm
-*.sqlite-wal
 
-# OS
-.DS_Store
-Thumbs.db
+# ==============================================
+# 项目特定：大型数据 / 运行时文件
+# ==============================================
+# ChromaDB 向量数据库
+chroma_db/
 
-# Editor
-.vscode/
-.idea/
-*.swp
+# 上传的知识库文件 (PDF/TXT)
+data/
 
-# Logs
-*.log
-npm-debug.log*
+# 旧 Express Server (组员前端 v1 遗留)
+/AgentHub-my flicker/server/
 
-# Build artifacts / large binaries
-*.zip
+# 面试准备材料（本地用，不参与构建）
+/interview-prep/
 
-# Local junk files
-up?*
-updateAgentSkill*
+# 杂项
+opencode如是说.md
 
 # CodeFlicker / agent metadata
 .codeflicker/
-
-#new
-/AgentHub-my-flicker/server/
-/interview-prep/
-opencode如是说.md
