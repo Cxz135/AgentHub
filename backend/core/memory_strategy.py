@@ -57,6 +57,9 @@ async def apply_memory_strategy(
         return messages
 
     strategy = str(memory_config.get("strategy", "")).lower()
+    if strategy not in ("none", "sliding_window", "summary", ""):
+        logger.warning(f"[memory] 未知的记忆策略 '{strategy}'，回退到原始 messages。有效值: none, sliding_window, summary")
+        return messages
 
     try:
         if strategy == "none":
@@ -115,6 +118,6 @@ async def apply_memory_strategy(
             return [{"role": "system", "content": f"【历史摘要】{summary_text}"}, *tail]
 
     except Exception as exc:
-        logger.warning(f"[memory] apply 失败，回退到原始 messages: {exc}")
+        logger.warning(f"[memory] apply 失败，回退到原始 messages（config={memory_config}）: {exc}", exc_info=True)
 
     return messages

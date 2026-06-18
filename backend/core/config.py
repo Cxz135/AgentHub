@@ -28,10 +28,13 @@ DEFAULT_MAX_RETRIES: int = 2
 Agent 验证失败后的最大重试次数。
 """
 
-REACT_MAX_ITERATIONS: int = 6
+QUALITY_THRESHOLD: int = 60
+ENABLE_QUALITY_CHECK: bool = True
+
+REACT_MAX_ITERATIONS: int = 3
 """
 ReAct AgentExecutor 的最大迭代次数。
-设为 6 以确保 web_search + 思考 + 最终输出有足够的轮次。
+注意：这个值比较小，因为每次迭代都涉及 LLM 调用。
 """
 
 # ========== LLM 配置 ==========
@@ -81,7 +84,8 @@ DEFAULT_SUMMARY_THRESHOLD: int = 4000
 """
 summary 策略的默认 token 阈值。
 """
-
+MAX_REPLAN_LIMIT: int = 2
+MAX_TASK_RETRIES: int = 3
 # ========== 数据库配置 ==========
 
 MEMORY_DB_NAME: str = "agenthub_memory.sqlite"
@@ -106,54 +110,6 @@ SKILL_PROMPT_TEMPLATE: str = """【重要】你必须始终使用中文回复，
 ERROR_TOOL_NOT_FOUND: str = "错误：工具 '{tool}' 不存在，可用工具：{available}"
 ERROR_TOOL_FAILED: str = "错误：工具执行失败：{error}"
 ERROR_MODEL_EMPTY: str = "错误：模型返回内容为空，请重试"
-
-# ========== Replan 与重试配置 ==========
-
-MAX_REPLAN_LIMIT: int = 2
-"""
-最大重规划次数。超过此次数后强制进入降级模式，防止无限循环 Replan。
-可通过环境变量 MAX_REPLAN_LIMIT 覆盖。
-"""
-
-QUALITY_THRESHOLD: int = 50
-"""
-内容质量评分阈值（0-100）。
-子任务结果质量评分低于此值视为不通过，触发重试或重规划。
-可通过环境变量 QUALITY_THRESHOLD 覆盖。
-"""
-
-MAX_TASK_RETRIES: int = 3
-"""
-单个子任务最大重试次数（包含首次执行）。
-可通过环境变量 MAX_TASK_RETRIES 覆盖。
-"""
-
-ENABLE_QUALITY_CHECK: bool = True
-"""
-是否启用内容质量检查特性开关。
-设置为 False 可降级为仅依赖异常判断的旧行为。
-可通过环境变量 ENABLE_QUALITY_CHECK 覆盖。
-"""
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    val = os.environ.get(name, str(default)).lower()
-    return val in ("1", "true", "yes", "on")
-
-
-# 从环境变量覆盖默认值
-MAX_REPLAN_LIMIT = _env_int("MAX_REPLAN_LIMIT", MAX_REPLAN_LIMIT)
-QUALITY_THRESHOLD = _env_int("QUALITY_THRESHOLD", QUALITY_THRESHOLD)
-MAX_TASK_RETRIES = _env_int("MAX_TASK_RETRIES", MAX_TASK_RETRIES)
-ENABLE_QUALITY_CHECK = _env_bool("ENABLE_QUALITY_CHECK", ENABLE_QUALITY_CHECK)
-
 
 # ========== 辅助函数 ==========
 

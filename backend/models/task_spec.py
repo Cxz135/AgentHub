@@ -32,3 +32,11 @@ class TaskResult(BaseModel):
 
     # 评估器备注，记录质量不通过原因等
     evaluator_notes: str = ""
+
+    # ===== v2: 黑板元数据 =====
+
+    # 黑板条目的置信度（0.0~1.0），Orchestrator 在写入黑板前可调整
+    blackboard_confidence: float = 1.0
+
+    # 该任务产出的黑板条目 key 列表
+    blackboard_keys: list[str] = []

@@ -27,13 +27,16 @@ _orchestrator_instance = None
 def get_orchestrator() -> Orchestrator:
     """
     FastAPI 依赖项，用于获取全局唯一的 Orchestrator 实例。
-    如果实例不存在，则创建它。Agent 的注册现在由 Orchestrator 内部处理。
+    如果实例不存在，则创建它。
+
+    注意：Orchestrator 创建时不传入持久化 db_session。
+    每个请求通过 chat.py / websocket.py 独立注入 request-scoped session，
+    避免全局 session 过期或跨请求污染。
     """
     global _orchestrator_instance
     if _orchestrator_instance is None:
         logger.info("正在创建全局 Orchestrator 实例...")
-        from backend.db.database import SessionLocal
-        _orchestrator_instance = Orchestrator(db_session=SessionLocal())
+        _orchestrator_instance = Orchestrator()
         logger.info("Orchestrator 实例创建完成。")
 
     return _orchestrator_instance

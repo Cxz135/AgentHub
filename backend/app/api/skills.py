@@ -507,3 +507,98 @@ def seed_native_skills_to_db(db: Session):
         logger.info(f"🎉 种子数据写入完成，共 {seeded_count} 个技能")
     else:
         logger.info("📦 所有原生技能已存在于数据库，无需写入")
+
+
+@router.post("/refresh")
+async def refresh_user_skills(current_user: UserModel = Depends(get_current_user)):
+    """
+    手动刷新用户 Skill（从数据库重新加载到 Orchestrator）。
+    用户创建/更新 Skill 后可以调用此接口立即生效，无需等待定时刷新。
+
+    注意：需要管理员权限或 Skill 作者才能刷新。
+    """
+    try:
+        from backend.app.dependencies import get_orchestrator
+        orchestrator = get_orchestrator()
+        orchestrator.refresh_user_skills()
+        logger.info(f"✅ 用户 {current_user.username} 触发了 Skill 刷新")
+        return {"ok": True, "message": "Skill 刷新成功"}
+    except Exception as e:
+        logger.error(f"❌ Skill 刷新失败: {e}")
+        return {"ok": False, "message": f"刷新失败: {str(e)}"}
+
+
+@router.get("/available")
+async def get_available_skills(current_user: UserModel = Depends(get_current_user)):
+    """
+    获取所有可用的 Skill 列表（内置 + 用户创建的已发布 Skill）。
+
+    返回格式包含 Skill 的元信息（name, description, icon），
+    前端用于渲染 Skill 管理面板。
+    """
+    from backend.app.dependencies import get_orchestrator
+
+    try:
+        orchestrator = get_orchestrator()
+
+        # 1. 内置 Skill（从 MD 文件加载）
+        builtin_skills = []
+        from pathlib import Path
+        skills_dir = Path(__file__).parent.parent.parent / "skills"
+        if skills_dir.exists():
+            for md_file in skills_dir.glob("*.md"):
+                skill_name = md_file.stem
+                content = orchestrator.native_skills.get(skill_name, "")
+                # 尝试解析 frontmatter
+                name = skill_name
+                description = ""
+                fm_match = re.match(r'^---\s*\n(.*?)\n---\s*\n', content, re.DOTALL) if content else None
+                if fm_match:
+                    for line in fm_match.group(1).split('\n'):
+                        if line.startswith('name:'):
+                            name = line[5:].strip().strip('"\'')
+                        elif line.startswith('description:'):
+                            description = line[12:].strip().strip('"\'')
+                builtin_skills.append({
+                    "slug": skill_name,
+                    "name": name,
+                    "icon": "extension",
+                    "description": description or f"内置技能: {skill_name}",
+                    "category": "builtin",
+                    "is_builtin": True
+                })
+
+        # 2. 用户创建的 Skill（从数据库加载）
+        from sqlalchemy import text
+        from backend.db.database import SessionLocal
+        db = SessionLocal()
+        result = db.execute(text(
+            "SELECT slug, name, icon, description, category FROM skills WHERE author_id IS NOT NULL AND is_published = 1"
+        ))
+        user_skills = result.fetchall()
+        db.close()
+
+        user_skills_list = []
+        for row in user_skills:
+            slug, name, icon, description, category = row
+            # 跳过已存在于内置 Skill 的
+            if slug in [s['slug'] for s in builtin_skills]:
+                continue
+            user_skills_list.append({
+                "slug": slug,
+                "name": name or slug,
+                "icon": icon or "extension",
+                "description": description or f"用户技能: {slug}",
+                "category": category or "custom",
+                "is_builtin": False
+            })
+
+        # 合并所有 Skill
+        all_skills = builtin_skills + user_skills_list
+
+        logger.info(f"[SKILLS-AVAILABLE] 返回 {len(all_skills)} 个可用 Skill")
+        return {"ok": True, "skills": all_skills}
+
+    except Exception as e:
+        logger.error(f"❌ 获取可用 Skill 失败: {e}")
+        return {"ok": False, "message": f"获取失败: {str(e)}", "skills": []}

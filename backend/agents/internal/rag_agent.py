@@ -11,9 +11,10 @@ class RAGAgent:
         """从知识库检索相关内容，是工作流的第一个节点"""
         logger.info("--- [RAGAgent] 开始检索知识库 ---")
         task_content = state.get("task_content", "")
+        current_user_id = state.get("current_user_id")
         try:
-            retrieved_docs = rag_retrieval(query=task_content, top_k=5)
-            logger.info(f"✅ 检索到{len(retrieved_docs)}条相关知识库内容")
+            retrieved_docs = rag_retrieval(query=task_content, top_k=5, user_id=current_user_id)
+            logger.info(f"✅ 检索到{len(retrieved_docs)}条相关知识库内容 (user_id={current_user_id})")
             return {
                 **state,
                 "retrieved_docs": retrieved_docs,

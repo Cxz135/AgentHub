@@ -110,7 +110,7 @@ pyvenv.cfg
 # ==============================================
 # Dependencies
 node_modules/
-
+server/
 # Build outputs
 build/
 dist/
@@ -280,3 +280,8 @@ updateAgentSkill*
 
 # CodeFlicker / agent metadata
 .codeflicker/
+
+#new
+/AgentHub-my-flicker/server/
+/interview-prep/
+opencode如是说.md

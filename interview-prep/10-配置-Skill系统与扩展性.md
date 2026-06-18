@@ -58,6 +58,16 @@ if score > WORKFLOW_TRIGGER_THRESHOLD:
 4. **可覆盖**：支持环境变量覆盖（`os.getenv("THRESHOLD", 6)`）
 5. **可文档化**：每个常量有注释说明其含义和影响
 
+**项目中的关键配置常量示例**：
+- `WORKFLOW_TRIGGER_THRESHOLD = 6`：工作流自动匹配的分数阈值
+- `REACT_MAX_ITERATIONS = 3`：ReAct 循环最大迭代次数
+- `MAX_REPLAN_LIMIT = 2`：动态规划最多重规划次数
+- `MAX_TASK_RETRIES = 3`：单个子任务最多重试次数
+- `QUALITY_THRESHOLD = 60`：质量检查的最低通过分数
+- `ENABLE_QUALITY_CHECK = True`：是否启用后置质量检查
+- `DEFAULT_SLIDING_WINDOW_SIZE = 10`：滑动窗口记忆策略的窗口大小
+- `DEFAULT_SUMMARY_THRESHOLD = 4000`：触发摘要压缩的 token 阈值
+
 ---
 
 ## Q2: YAML prompt 模板系统是如何设计的？变量替换是怎么实现的？

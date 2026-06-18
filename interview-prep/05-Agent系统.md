@@ -185,9 +185,20 @@ Thought: 根据搜索结果...
 Final Answer: ...
 ```
 
-**3. 循环控制**：通过 `REACT_MAX_ITERATIONS = 3` 限制最大循环次数，防止无限 ReAct 循环消耗过多 token
+**3. 循环控制**：通过 `REACT_MAX_ITERATIONS = 3` 限制最大循环次数，防止无限 ReAct 循环消耗过多 token。支持按 Agent 自定义步数上限：Agent 可设置 `react_max_iterations` 属性，创建 Executor 时优先生效，否则使用全局默认值。
 
-**4. 执行流程**：LLM 输出 → 解析 Action → 执行 Tool → 将 Observation 反馈给 LLM → 循环直到输出 Final Answer 或达到最大迭代
+**4. 纯生成任务跳过 ReAct**：在 `_call_agent_with_tools` 中，先检测 prompt 是否包含工具相关关键词（web_search、rag_retrieval、scan_vulnerabilities、SKILL_CALL 等）。如果不含任何工具关键词，判定为纯生成任务（文档/代码/报告），直接 `break` 跳出 ReAct 路径，走 `process_message()` 方法——无迭代限制，避免长输出被 `max_iterations` 截断。
+
+**5. 工具使用约束注入**：对于需要工具的请求，在 prompt 末尾注入约束提示：
+```
+【工具使用约束】你最多调用工具 3 次。
+如果连续 2 次搜索返回空结果，必须停止搜索，
+直接基于已有知识输出 Final Answer。
+禁止用不同措辞重复搜索同一主题。
+```
+这会减少 LLM 在搜索无结果时的无效重复调用。
+
+**6. 执行流程**：LLM 输出 → 解析 Action → 执行 Tool → 将 Observation 反馈给 LLM → 循环直到输出 Final Answer 或达到最大迭代
 
 ---
 

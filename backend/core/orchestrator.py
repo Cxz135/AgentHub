@@ -103,6 +103,8 @@ class Orchestrator:
         self._load_custom_agents_from_db()
         # 6. 初始化边界情况 & Replan 闭环模块
         self._init_boundary_modules()
+        # 7. 初始化记忆管理器（书记官 + 长期记忆，均为内部服务，不是子 Agent）
+        self._init_memory_manager()
         logger.info("✅ Orchestrator 初始化完成，所有组件加载成功。")
 
     def _init_boundary_modules(self):
@@ -127,8 +129,129 @@ class Orchestrator:
             )
         except Exception as e:
             logger.warning(f"⚠️ 边界模块初始化失败（非致命，降级运行）: {e}")
-            self.quality_checker = None
-            self.replan_evaluator = None
+
+    def _init_memory_manager(self):
+        """初始化记忆管理器（书记官 + 长期记忆，均为内部服务，不是子 Agent）。"""
+        try:
+            from backend.memory import MemoryManager, MemoryConfig
+
+            config = MemoryConfig(
+                short_term_window_size=20,
+                long_term_semantic_enabled=True,
+                long_term_extraction_enabled=True,
+                write_guard_enabled=True,
+                session_compression_enabled=True,
+                session_compression_max_tokens=8000,
+                instruction_scopes=["global"],
+                llm_backend=self.get_backend("tongyi"),
+                db_session=self.db_session,
+            )
+
+            # 尝试注入 embedding model（用于语义检索）
+            try:
+                from backend.rag.vector_store import EmbeddingsFactory
+                config.embed_model = EmbeddingsFactory().generator()
+            except Exception:
+                logger.debug("[MEMORY] 无 embedding model，语义检索不可用")
+
+            self.memory_manager = MemoryManager(config)
+            logger.info("✅ 记忆管理器初始化完成 (MemoryManager + 书记官 + 长期记忆)")
+        except Exception as e:
+            self.memory_manager = None
+            logger.warning(f"⚠️ 记忆管理器初始化失败（非致命，降级运行）: {e}")
+
+    # ── 记忆钩子（内部服务方法，不是子 Agent） ──
+
+    async def _record_session_memory(
+        self, task, result_text: str, task_state, agent_id: str
+    ) -> None:
+        """
+        书记官：子任务完成后立即记录结构化会话记忆。
+
+        这不是一个子 Agent！它是 Orchestrator 内部的后台服务方法。
+        在每个子任务成功完成后被 _execute_tasks_node 同步调用。
+
+        设计原则：
+        - 只记录子任务的"干净产出 + 任务描述"，不记录 ReAct 思考链
+        - 使用简单规则提取关键句子，不调用 LLM（避免额外延迟和成本）
+        - 失败不影响主流程
+        """
+        if not self.memory_manager:
+            return
+
+        try:
+            task_id = getattr(task, "step_id", "unknown")
+            task_goal = getattr(task, "prompt", getattr(task, "description", ""))[:100]
+            status = "completed" if task_state in ("succeeded", "retried", TaskState.SUCCEEDED, TaskState.RETRIED) else "failed"
+
+            await self.memory_manager.record_session_entry(
+                task_id=task_id,
+                task_goal=task_goal,
+                result=result_text,
+                agent_id=agent_id,
+                status=status,
+            )
+            logger.debug(f"[ORCH] 书记官已记录: {task_id}")
+        except Exception as e:
+            logger.warning(f"[ORCH] 书记官记录失败（非致命）: {e}")
+
+    async def _build_context_for_task(
+        self, task, user_id: int
+    ) -> str:
+        """
+        任务上下文构建：子任务执行前，从长期记忆 + 黑板中检索相关信息。
+
+        子 Agent 只能看到 Orchestrator 注入的上下文片段，不能直接访问记忆库。
+        """
+        if not self.memory_manager:
+            return ""
+
+        try:
+            task_desc = getattr(task, "prompt", getattr(task, "description", ""))
+            dependencies = getattr(task, "dependencies", []) or []
+            ctx = await self.memory_manager.build_context_for_task(
+                task_description=task_desc,
+                user_id=user_id,
+                task_dependencies=dependencies,
+            )
+            return ctx
+        except Exception as e:
+            logger.debug(f"[ORCH] 上下文构建失败（非致命）: {e}")
+            return ""
+
+    async def _update_long_term_memory_node(
+        self, state: GraphState
+    ) -> Dict[str, Any]:
+        """
+        长期记忆更新节点：工作流收尾时调用。
+
+        这不是一个子 Agent！它是 LangGraph 中的一个普通节点。
+        放在 generate_summary 之后，提取整场对话的稳定事实。
+
+        与每轮 consolidate 的区别：
+        - consolidate：单轮粒度，高频
+        - 本节点：全局粒度，仅在工作流结束时执行一次
+        """
+        if not self.memory_manager:
+            logger.debug("[ORCH] 无 MemoryManager，跳过长期记忆更新")
+            return {}
+
+        try:
+            user_id = state.get("current_user_id", 0)
+            conversation_id = state.get("conversation_id", 0)
+            final_summary = state.get("final_summary", "")
+
+            count = await self.memory_manager.update_long_term_memory(
+                user_id=user_id,
+                conversation_id=conversation_id,
+                messages=None,  # state 中的 messages 可能很大，用 summary 代替
+                final_summary=final_summary,
+            )
+            logger.info(f"[ORCH] 长期记忆更新完成: {count} 条")
+        except Exception as e:
+            logger.warning(f"[ORCH] 长期记忆更新失败（非致命）: {e}")
+
+        return {}
 
     def _setup_backends(self):
         """
@@ -1669,6 +1792,7 @@ class Orchestrator:
         workflow.add_node("execute_tasks", self._execute_tasks_node)
         workflow.add_node("evaluate_results", self._evaluate_results_node)
         workflow.add_node("generate_summary", self._generate_summary_node)
+        workflow.add_node("update_long_term_memory", self._update_long_term_memory_node)
 
         workflow.set_entry_point("execute_tasks")
         workflow.add_edge("execute_tasks", "evaluate_results")
@@ -1689,7 +1813,9 @@ class Orchestrator:
                 "execute_again": "execute_tasks"
             }
         )
-        workflow.add_edge("generate_summary", END)
+        # generate_summary → update_long_term_memory → END
+        workflow.add_edge("generate_summary", "update_long_term_memory")
+        workflow.add_edge("update_long_term_memory", END)
 
         return workflow
     async def _execute_tasks_node(self, state: GraphState) -> Dict[str, Any]:
@@ -1761,7 +1887,13 @@ class Orchestrator:
                     if active_skills_list:
                         active_skills_injection = self.get_active_skills_injection(active_skills_list)
 
-                    full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}{self._format_acceptance_criteria(task)}"
+                    # 📌 记忆上下文注入（长期记忆 + 黑板）
+                    memory_context = await self._build_context_for_task(
+                        task=task,
+                        user_id=state.get("current_user_id", 0),
+                    )
+
+                    full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{memory_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}{self._format_acceptance_criteria(task)}"
 
                     # 使用重试+质量检查辅助方法
                     result_text, task_state, quality = await self._execute_single_task_with_retry(
@@ -1829,6 +1961,14 @@ class Orchestrator:
                             agent_id=agent_id,
                             content=f"📝 任务{step_id}完成：\n{r['result']}"
                         )
+                    # 📌 书记官记录：子任务完成后立即写结构化记忆
+                    await self._record_session_memory(
+                        task=task_info,
+                        result_text=r["result"],
+                        task_state=task_state,
+                        agent_id=agent_id,
+                    )
+
                     status_icon = "✅" if task_state in (TaskState.SUCCEEDED, TaskState.RETRIED) else "❌"
                     logger.info(f"📤 子任务{step_id}完成({task_state})，结果：{r['result'][:100]}...")
                 
@@ -1869,7 +2009,13 @@ class Orchestrator:
             if active_skills_list:
                 active_skills_injection = self.get_active_skills_injection(active_skills_list)
 
-            full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}{self._format_acceptance_criteria(task)}"
+            # 📌 记忆上下文注入（长期记忆 + 黑板）
+            memory_context = await self._build_context_for_task(
+                task=task,
+                user_id=state.get("current_user_id", 0),
+            )
+
+            full_prompt = f"{skills_prompt}{active_skills_injection}\n{runtime_context}\n{memory_context}\n{workspace_context}\n=== 当前任务 ===\n{prompt}{self._format_acceptance_criteria(task)}"
 
             # 使用重试+质量检查辅助方法
             result_text, task_state, quality = await self._execute_single_task_with_retry(
@@ -1912,6 +2058,14 @@ class Orchestrator:
             })
             # 实时推送 artifact 到 SSE 队列
             push_artifacts_to_queue(artifacts, getattr(self, '_progressive_queue', None), agent_id)
+            # 📌 书记官记录：顺序子任务完成后写结构化记忆
+            await self._record_session_memory(
+                task=task,
+                result_text=result_text,
+                task_state=task_state,
+                agent_id=agent_id,
+            )
+
             status_icon = "✅" if task_state in (TaskState.SUCCEEDED, TaskState.RETRIED) else "❌"
             logger.info(f"📤 顺序子任务{task.step_id}完成({task_state})，结果：{result_text[:100]}...")
 

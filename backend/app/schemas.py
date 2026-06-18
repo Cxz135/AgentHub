@@ -11,11 +11,24 @@ class Message(BaseModel):
     id: int
     conversation_id: int
     agent_id: str
-    content: str
+    content: str  # JSON 格式：{type, content, metadata}
     created_at: datetime
+    message_type: Optional[str] = "text"  # text/code/image/file/webcard
+    meta_data: Optional[dict] = {}  # 包含: quoted_message_id, regenerate_count, is_expanded 等
+    is_pinned: Optional[bool] = False
+    mentions: Optional[List[int]] = []
 
     class Config:
-            from_attributes = True
+        from_attributes = True
+        populate_by_name = True
+
+
+class MessageOperation(BaseModel):
+    """消息操作请求"""
+    action: str  # "quote" | "regenerate" | "copy" | "expand"
+    message_id: Optional[int] = None
+    quoted_message_id: Optional[int] = None  # 引用时指定
+    regenerate_params: Optional[dict] = None  # 重新生成参数
 
 
 class Conversation(BaseModel):
@@ -92,6 +105,7 @@ class ChatStreamRequest(BaseModel):
     message: str
     conversation_id: Optional[int] = None
     agent: Optional[dict] = None  # {id, name, llm_adapter, model_name, system_prompt}
+    active_skills: Optional[List[str]] = []  # 用户启用的 Skill 列表
 
 
 class IntermediateMessage(BaseModel):

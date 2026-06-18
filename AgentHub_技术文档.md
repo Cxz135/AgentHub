@@ -1,9 +1,10 @@
 # AgentHub - 多Agent协作平台 技术文档
 
-**版本**：v1.0
-**更新日期**：2026-06-09
+**版本**：v1.1
+**更新日期**：2026-06-18
 **文档类型**：技术架构文档
 **目标读者**：后端开发工程师 / 智能体开发程序员（3年经验）
+**作者**：[@Cxz135](https://github.com/Cxz135)
 
 ---
 
@@ -136,26 +137,30 @@ def __init__(self, db_session=None):
 ```
 get_chat_response()
 │
+├─ 🧠 前置：多层记忆语义检索增强上下文
+│   └─ MemoryService.augment_context() → 检索相关记忆 + 用户画像
+│
 ├─ 1. @mention 检测
-│   ├─ 单个 @ → _handle_mention()
-│   └─ 多个 @ → _handle_multiple_mentions()
+│   ├─ 单个 @ → _handle_mention() （含 Agent Fallback 链）
+│   └─ 多个 @ → _handle_multiple_mentions() （多 Agent 群聊，顺序执行）
 │
-├─ 2. Agent 管理请求（LLM 分类器判断）
-│   └─ _handle_agent_management_request()
+├─ 2. Agent 管理请求（LLM 分类器判断 agent_management）
+│   └─ _handle_agent_management_request() → agent_builder
 │
-├─ 3. 自动匹配固定工作流（关键词打分）
-│   └─ _handle_workflow_command()
+├─ 3. 自动匹配固定工作流（关键词打分，阈值 WORKFLOW_TRIGGER_THRESHOLD=6）
+│   ├─ RAG 工作流（"什么是"、"知识库"等）
+│   └─ Code Review 工作流（"代码审查"、"review"等，有额外 +2 加分）
 │
-├─ 4. 复杂度路由
-│   ├─ complex → _handle_plan_command() (PlannerAgent + LangGraph)
-│   ├─ moderate → _handle_default_chat() (直接执行)
-│   └─ simple → _handle_simple_chat() (Orchestrator 直接回复)
+├─ 4. LLM 复杂度路由（_classify_complexity, LLM 优先 + 关键词降级兜底）
+│   ├─ complex → _handle_plan_command() (PlannerAgent + LangGraph 动态规划)
+│   ├─ moderate → _handle_default_chat() (路由到专家 Agent + ReAct 工具)
+│   └─ simple → _handle_simple_chat() (Orchestrator 直接调用 LLM)
 │
-├─ 5. Skill 调用请求（正则解析）
+├─ 5. 系统查询（Agent 列表 / Skill 列表 / 能力查询）
+│   └─ Orchestrator 自回复
 │
-├─ 6. 系统查询（列表/帮助等）
-│
-└─ 7. 默认：普通聊天
+└─ 6. 默认：普通聊天（_handle_default_chat）
+    └─ 记忆策略裁剪 → Skill 注入 → ReAct/直接执行 → 校验 → 记忆提取后置
 ```
 
 #### 2.1.4 LLM 后端管理
@@ -347,16 +352,17 @@ def _parse_plan_from_response(self, response_str: str) -> List[Dict]:
 ```python
 class GraphState(TypedDict):
     task_content: str              # 任务原始内容
-    plan_data: Dict[str, Any]       # Planner 生成的计划
-    tasks: List[TaskSpec]           # 任务规格列表
+    plan_data: Dict[str, Any]       # Planner 生成的计划（含 dependencies 依赖图）
+    tasks: List[TaskSpec]           # 任务规格列表（TaskSpec 模型）
     step_results: Dict[int, Any]    # 按步骤编号存储执行结果
-    final_summary: str              # 最终总结报告
+    final_summary: str              # 最终总结报告（同时作为"结束信号"）
     conversation_id: str           # 会话 ID
     next_steps_to_execute: List[int]# 下一个要执行的步骤编号
     messages: List[BaseMessage]    # AI 对话历史
     memory_summary: str             # 历史摘要（压缩）
+    plan_iteration: int             # 重规划次数（用于硬条件判定）
     agent_outputs: List[Dict]       # 各子 Agent 输出（前端展示用）
-    shared_workspace: dict          # 共享工作空间
+    shared_workspace: dict          # 共享工作空间（黑板模式，跨任务上下文传递）
 ```
 
 #### 2.5.2 动态规划工作流图
@@ -365,21 +371,40 @@ class GraphState(TypedDict):
 def _build_planning_graph(self) -> StateGraph:
     workflow = StateGraph(GraphState)
 
-    # 节点定义
-    workflow.add_node("planner", self._plan_node)
-    workflow.add_node("executor", self._execute_node)
-    workflow.add_node("aggregator", self._aggregate_node)
-    workflow.add_node("summarizer", self._summarize_node)
+    # 节点定义（3 节点 + 条件循环）
+    workflow.add_node("execute_tasks", self._execute_tasks_node)
+    workflow.add_node("evaluate_results", self._evaluate_results_node)
+    workflow.add_node("generate_summary", self._generate_summary_node)
 
     # 边定义
-    workflow.add_edge("planner", "executor")
-    workflow.add_edge("executor", "aggregator")
-    workflow.add_edge("aggregator", "summarizer")
-    workflow.add_edge("summarizer", END)
+    workflow.set_entry_point("execute_tasks")
+    workflow.add_edge("execute_tasks", "evaluate_results")
 
-    workflow.set_entry_point("planner")
-    return workflow.compile(checkpointer=AsyncSqliteSaver)
+    # 条件边：根据评估结果决定下一步
+    def after_evaluation(state: GraphState) -> str:
+        if state.get("final_summary"):
+            return "summarize"       # 通过 → 生成摘要
+        return "execute_again"       # 不通过 → 重新执行（重规划）
+
+    workflow.add_conditional_edges(
+        "evaluate_results",
+        after_evaluation,
+        {
+            "summarize": "generate_summary",
+            "execute_again": "execute_tasks",
+        }
+    )
+    workflow.add_edge("generate_summary", END)
+
+    return workflow
 ```
+
+**执行流程**：
+1. **execute_tasks**：PlannerAgent 拆解任务 → 拓扑排序（按依赖关系）→ 并行执行无依赖子任务（Semaphore 最大并发 3），通过 shared_workspace（黑板模式）共享上下文
+2. **evaluate_results**：ReplanEvaluator 两层决策评估（先硬条件判定，再 LLM 语义评估）→ 返回 complete/replan/degrade
+3. **generate_summary**：SummarizerAgent 整合所有子任务结果 → 输出最终回答
+
+**关键设计**：条件边 `after_evaluation` 使 planner 和 executor 合并为一个动态节点，评估不通过时自动回到 execute_tasks 重试（增量重试而非全部重来）。
 
 #### 2.5.3 固定工作流示例
 
@@ -422,11 +447,48 @@ def _auto_match_workflow(self, content: str) -> str | None:
 
 ---
 
-### 2.6 记忆策略（Memory Strategy）
+### 2.6 记忆系统（Memory System）
 
-**文件位置**：`backend/core/memory_strategy.py`
+AgentHub 实现了完整的 **5 层记忆框架** + **业务编排服务**，从短期到长期、从具体到抽象层层递进。
 
-#### 2.6.1 三种策略
+**文件位置**：
+- 5 层框架：`backend/memory/`（manager.py, base.py, instruction_memory.py, short_term_memory.py, working_memory.py, summary_memory.py, long_term_memory.py）
+- 业务服务：`backend/services/`（memory_service.py, memory_extractor.py, memory_retriever.py, memory_decayer.py, user_profiler.py）
+
+#### 2.6.1 5 层记忆架构
+
+| 层级 | 模块 | 职责 | 生命周期 |
+|------|------|------|----------|
+| **指令记忆** | `InstructionMemory` | 持久化的系统指令/约束，支持 global 和 per-agent 作用域 | 持久 |
+| **短期记忆** | `ShortTermMemory` | 当前对话窗口，支持 none/sliding_window/summary 三种裁剪策略 | 会话级 |
+| **工作记忆** | `WorkingMemory` | 当前任务执行状态跟踪（目标、进度、中间结果） | 任务级 |
+| **摘要记忆** | `SummaryMemory` | 历史对话的 LLM 压缩摘要 | 会话级 |
+| **长期记忆** | `LongTermMemory` | ChromaDB 语义检索 + LLM 事实提取 + 用户画像 | 跨会话持久 |
+
+**MemoryManager（中央编排器）**：`backend/memory/manager.py`
+- `gather_context()` — 对话前从各层收集上下文（按优先级：instruction → short_term → working → long_term → summary）
+- `consolidate()` — 对话后在各层持久化新记忆
+- 支持按层独立启用/禁用（`enable_layer`/`disable_layer`）
+
+#### 2.6.2 记忆业务管线（MemoryService）
+
+**前置：augment_context()** — LLM 调用前增强上下文：
+1. MemoryRetriever 做 ChromaDB 语义检索（cosine 相似度，top_k=5，按 user_id 过滤）
+2. 更新被检索记忆的访问计数（boost 机制）
+3. UserProfiler 获取用户画像文本
+
+**后置：on_conversation_turn()** — LLM 回复后提取并持久化（fire-and-forget）：
+1. MemoryExtractor（LLM 驱动）从最近 6 条消息中提取结构化事实：fact / preference / decision / user_trait
+2. 置信度过滤（MIN_CONFIDENCE=0.6）+ ChromaDB 语义去重（相似度 > 92% 视为重复）
+3. 持久化到 SQL + ChromaDB（双写）
+4. 增量更新用户画像
+5. MemoryDecayer 衰减旧记忆（每 10 条新记忆触发一次，艾宾浩斯曲线）
+
+**特性开关**：`MEMORY_ENABLED` 环境变量控制，关闭时 memory_service 为 None，不影响核心对话功能。
+
+#### 2.6.3 对话记忆策略（Memory Strategy）
+
+`backend/core/memory_strategy.py` — per-Agent 可配置的上下文裁剪：
 
 ```python
 async def apply_memory_strategy(messages, memory_config, llm_invoke=None):
@@ -446,21 +508,79 @@ async def apply_memory_strategy(messages, memory_config, llm_invoke=None):
         est = _estimate_tokens(messages)
         if est <= threshold:
             return messages
-        # 摘要历史消息，保留最近 2 条
+        # 超过阈值：LLM 压缩历史为摘要，保留最近 2 条
         history = messages[:-2]
         summary_resp = await llm_invoke(summary_messages)
         return [{"role": "system", "content": f"【历史摘要】{summary_resp}"}, *messages[-2:]]
 ```
 
-**设计亮点**：记忆策略与主工作流解耦，可按 Agent 独立配置，实现个性化上下文管理。
+**设计亮点**：5 层记忆框架 + 业务编排管线彻底解耦。MemoryManager 管"怎么做"，MemoryService 管"什么时候做"，Orchestrator 只需在对话前后调用两个方法即可实现完整的记忆增强。
 
 ---
 
-### 2.7 校验策略（Validation Strategy）
+### 2.5.4 ReplanEvaluator（重规划评估器）
+
+**文件位置**：`backend/core/replan_evaluator.py`
+
+与 PlannerAgent 解耦的独立评估角色，只负责判断"是否需要 replan/降级/重试"，不负责生成新任务计划。
+
+**两层决策链路**：
+
+**第一层：代码规则引擎（硬条件判定）** — 纯代码逻辑，优先级最高：
+1. `plan_iteration >= max_replan_limit`（MAX_REPLAN_LIMIT=2）→ 强制 degrade
+2. 子任务已 retried 仍失败（state == "retried" 且 passed == false）→ replan
+3. 所有子任务都失败（succeeded_count == 0）→ replan
+
+**第二层：LLM 语义评估** — 仅在硬条件未触发时调用：
+- `ReplanEvaluator.evaluate()` 调用 LLM 分析 valid_results + failed_tasks
+- 返回 `EvaluationVerdict{action, reason, confidence}`
+- 四种 action：`retry` / `replan` / `degrade` / `complete`
+
+**职责边界**：
+- ReplanEvaluator → 判断状态，返回 action
+- PlannerAgent → 生成新计划，返回 TaskSpec[]
+
+**异常降级**：LLM 调用异常时自动降级为 `replan (confidence=0.3)`，JSON 解析失败时同样降级。
+
+#### 2.5.5 PlanAnalyzer（计划复杂度分析器）
+
+**文件位置**：`backend/core/plan_analyzer.py`
+
+纯函数模块，从 Planner 输出的 TaskSpec 列表中分析三个维度：
+- **步骤数**：1-3=simple, 4-7=moderate, 8+=complex
+- **依赖深度**：DAG 拓扑排序计算深度，depth≤1=simple, 2=moderate, ≥3=complex
+- **工具多样性**：统计涉及的 Agent 种类，1=simple, 2-3=moderate, 4+=complex
+
+综合判定取三个维度的最高级别，不依赖 LLM 调用。
+
+---
+
+### 2.7 质量检查（Quality Checker）与响应完整性
+
+**文件位置**：`backend/core/quality_checker.py`、`backend/core/response_checker.py`
+
+#### 2.7.1 验收标准检查
+
+`_check_acceptance_criteria()` 实现了三项检查，均有容错阈值设计：
+
+1. **must_include（必须包含）**：子串匹配（不区分大小写），缺失 ≤30% 仍通过
+2. **must_not_include（禁止出现）**：命中 ≤30% 放行，100% 命中直接标红，>30% 则标为验收不通过
+3. **min_length（最小长度）**：字符数检查
+
+#### 2.7.2 响应完整性检查
+
+`check_response_completeness()` 检测 Agent 回复是否被截断：
+- 检查未闭合的代码块和 JSON
+- 检测模糊语言（"需要更多信息"等）
+- 截断时自动触发 continuation 请求
+
+---
+
+### 2.8 校验策略（Validation Strategy）
 
 **文件位置**：`backend/core/validation_strategy.py`
 
-#### 2.7.1 三种策略
+#### 2.8.1 三种策略
 
 | 策略 | 说明 | 实现方式 |
 |------|------|----------|
@@ -490,7 +610,7 @@ async def apply_validation_strategy(output_text, validation_config, llm_invoke):
 
 ---
 
-### 2.8 Chat API 与 SSE 流式
+### 2.9 Chat API 与 SSE 流式
 
 **文件位置**：`backend/app/api/chat.py`
 
@@ -552,7 +672,7 @@ async def _chat_stream_impl(req: ChatStreamRequest, current_user):
 
 ---
 
-### 2.9 数据库模型
+### 2.10 数据库模型
 
 **文件位置**：`backend/models/`
 
@@ -755,24 +875,30 @@ function handleSSEEvent(type, data) {
 
 通过 `LLMBackend` 抽象接口，屏蔽了不同 LLM API 的差异，使得：
 - 切换 LLM 后端只需修改配置
-- 新增 LLM 后端只需实现两个方法
+- 新增 LLM 后端只需实现 `chat()` 和 `chat_stream()` 两个方法
 - 业务代码与具体 LLM 解耦
+- 启动时自动健康检查，不可用后端自动移除
 
-### 5.2 动态规划 + 静态工作流双轨制
+### 5.2 动态规划 + 固定工作流双轨制
 
-- **动态规划**：复杂任务由 PlannerAgent 自动拆解，通过 LangGraph 执行
-- **固定工作流**：简单任务通过关键词匹配直接路由到预设工作流
+- **动态规划**：复杂任务由 PlannerAgent 自动拆解，通过 LangGraph 3 节点闭环执行（execute → evaluate → replan → summarize），ReplanEvaluator 两层决策（硬条件 + LLM 语义）
+- **固定工作流**：高频场景（RAG、CodeReview）通过关键词匹配直接路由到预设工作流，避免不必要的 LLM 规划开销
 
-这种设计平衡了灵活性与性能，避免复杂任务也走固定流程的笨拙。
+### 5.3 5 层记忆框架 + 业务编排管线
 
-### 5.3 多层次 Skill 系统
+- **5 层记忆**：指令记忆 / 短期记忆 / 工作记忆 / 摘要记忆 / 长期语义记忆，层层递进
+- **LLM 驱动事实提取**：从对话中自动提取 fact/preference/decision/user_trait 四类结构化事实
+- **ChromaDB 语义检索**：cosine 相似度 + user_id 过滤，前置增强上下文
+- **艾宾浩斯衰减**：访问 boost 机制 + 时间衰减，模拟人类遗忘曲线
+- **用户画像**：跨会话积累用户偏好和特征
 
-- **能力类 Skill**（MD 文件）：纯自然语言描述，可自定义，通过 prompt 拼装调用
+### 5.4 多层次 Skill 系统
+
+- **能力类 Skill**（MD 文件）：纯自然语言描述，用户可自建，通过 prompt 拼装调用
 - **工具类 Skill**（Python 函数）：可执行代码，注册为 LangChain Tool，支持 ReAct 循环
+- 以 `web_search` 为例，实现了结构化清洗管道：HTML 清洗 → Jaccard 标题去重 → 相关性打分（标题权重 3 + 正文权重 1 + 短内容惩罚 + URL 加分）→ Top-5 排序
 
-两种 Skill 各有优势，可按场景选择。
-
-### 5.4 per-Agent 精细化配置
+### 5.5 per-Agent 精细化配置（A-Tier）
 
 自定义 Agent 支持独立配置：
 - `memory_config`：上下文记忆策略（none/sliding_window/summary）
@@ -781,18 +907,13 @@ function handleSSEEvent(type, data) {
 
 这使得不同 Agent 可以有不同的行为特性，提高系统灵活性。
 
-### 5.5 失败降级机制
+### 5.6 全链路容错降级
 
-```python
-try:
-    final_state = await app.astream(initial_state, config=config)
-except Exception as e:
-    # 降级：直接调用 LLM 生成基础回答
-    fallback_response = await self.get_backend("tongyi").chat([
-        {"role": "user", "content": f"用户的问题是：{task_content}..."}
-    ])
-    return {"content": f"⚠️ 复杂任务调度遇到小问题，不过我依然可以帮你解答：\n{fallback_response}"}
-```
+- **LLM 后端**：启动健康检查 + Agent Fallback 降级链
+- **工作流**：ReplanEvaluator 硬条件上限（MAX_REPLAN_LIMIT=2）→ degrade 降级为直接 LLM 调用
+- **质量检查**：must_include / must_not_include 双阈值容错（≤30% 放行）
+- **记忆服务**：try/except 包裹，失败不影响主流程（非致命错误）
+- **纯生成任务优化**：检测到文档/代码/报告类任务时跳过 ReAct 循环，直接调用 LLM，避免长输出被 max_iterations 截断
 
 ---
 
@@ -838,28 +959,21 @@ except Exception as e:
 
 ## 7. 已知问题与改进方向
 
-### 7.1 流式输出不稳定
+### 7.1 当前状态
 
-**问题**：`/api/chat/stream` 端点的 SSE 流式输出时常出现问题
+流式输出已通过 `progressive_queue`（asyncio.Queue）+ `get_chat_stream()` async generator 实现了稳定的伪流式输出。LLM 后端的 `chat_stream()` 原生流式 token 通过 backend 层正确提取，但在 LangGraph 动态规划节点中，子 Agent 的流式 token 需要通过 `progressive_queue` 转发而非直接从图节点 yield。
 
-**原因**：
-1. `Orchestrator.get_chat_response()` 返回的是完整内容，不是流式 generator
-2. LangGraph 的 `astream()` 输出的是中间状态，不是 LLM token 流
-3. 当前实现是"伪流式"，真正的 token 流未正确提取
-
-**改进方案**：
-1. 实现 WebSocket 双向通信，支持真正的实时流
-2. 在 LangGraph 节点中提取 LLM 的 `chat_stream()` token 并转发
-3. 添加流式状态管理和错误重试机制
-
-### 7.2 其他改进方向
+### 7.2 改进方向
 
 | 方向 | 说明 |
 |------|------|
+| WebSocket 实时流 | 当前以 SSE 为主，WebSocket 可提供双向实时通信 |
 | 数据库迁移 | 引入 Alembic 进行数据库版本管理 |
-| 缓存层 | 引入 Redis 缓存热点数据 |
-| 监控 | 添加 Prometheus metrics |
+| 缓存层 | 引入 Redis 缓存热点数据 + 分布式 WebSocket pub/sub |
+| 监控 | 添加 Prometheus metrics + OpenTelemetry 分布式追踪 |
 | 测试 | 补充单元测试和集成测试覆盖率 |
+| 记忆"遗忘" | 当前不支持自然语言"忘掉之前说的"自动删除记忆 |
+| 分布式部署 | Orchestrator 从单例升级为分布式协调（适用于多实例部署） |
 
 ---
 
@@ -918,17 +1032,18 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 AgentHub 是一个设计良好的多 Agent 协作平台，具有以下特点：
 
 1. **清晰的架构分层**：从 API 到 Orchestrator 到 Agent 到 LLMBackend，层次分明
-2. **灵活的扩展性**：通过抽象接口和注册表模式，支持轻松扩展
-3. **完善的路由机制**：多层次决策树支持各种场景的消息路由
-4. **健壮的容错**：失败降级机制保证系统不会完全崩溃
+2. **灵活的扩展性**：通过抽象接口和注册表模式，支持轻松扩展 LLM 后端、Agent、工作流、Skill
+3. **完善的路由机制**：5 级优先级决策树支持各种场景的消息路由，LLM 复杂度分类 + 关键词降级兜底
+4. **健壮的容错**：全链路降级机制（LLM 后端 Fallback 链 + Replan 硬上限 + 质量检查容错 + 纯生成任务 ReAct 跳过）
+5. **5 层记忆框架**：从指令记忆到长期语义记忆，LLM 驱动事实提取 + ChromaDB 语义检索 + 艾宾浩斯衰减
 
 核心创新点在于：
-- **动态规划 + 固定工作流双轨制**：平衡灵活性与性能
-- **多层次 Skill 系统**：能力类 + 工具类满足不同场景
-- **per-Agent 精细化配置**：memory/planning/validation 独立可配
-
-主要待改进问题是 **SSE 流式输出的稳定性**，建议后续引入 WebSocket 或修复 LangGraph 流式 token 提取逻辑。
+- **动态规划 + 固定工作流双轨制**：平衡灵活性与性能，ReplanEvaluator 两层决策保证评估可靠性
+- **5 层记忆 + 业务编排管线**：MemoryManager（底层管理）+ MemoryService（上层编排）彻底解耦
+- **多层次 Skill 系统**：能力类 + 工具类满足不同场景，web_search 清洗管道提纯搜索结果
+- **per-Agent 精细化配置（A-Tier）**：memory/planning/validation 独立可配
+- **全链路容错降级**：从 LLM 调用到工作流执行到质量检查，每一层都有降级方案
 
 ---
 
-*文档版本：v1.0 | 更新日期：2026-06-09*
+*文档版本：v1.1 | 更新日期：2026-06-18 | 作者：[@Cxz135](https://github.com/Cxz135)*

@@ -1,8 +1,9 @@
 import uuid
 from datetime import datetime
-from sqlalchemy import Column, String, JSON, ForeignKey, DateTime
+from sqlalchemy import Column, String, JSON, ForeignKey, DateTime, Integer
 from sqlalchemy.orm import relationship
 from backend.db.database import Base
+
 
 class Artifact(Base):
     """
@@ -11,10 +12,11 @@ class Artifact(Base):
     __tablename__ = 'artifacts'
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    message_id = Column(String, ForeignKey("messages.id"), nullable=False)
-    message = relationship("Message")
+    message_id = Column(String, ForeignKey("messages.id"), nullable=True)  # 可空：通过 conversation_id 关联
+    conversation_id = Column(Integer, nullable=True, index=True)  # 直接关联对话
+    message = relationship("Message", foreign_keys=[message_id])
 
-    # 产物类型，例如 "code", "diff", "preview_url", "file"
+    # 产物类型，例如 "code", "diff", "preview_url", "file", "html_preview", "markdown", "diagram", "table"
     type = Column(String, nullable=False)
 
     # 产物的内容或引用

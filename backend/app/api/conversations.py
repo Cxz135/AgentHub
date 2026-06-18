@@ -66,13 +66,15 @@ async def create_mission(
 ):
     """创建新的mission - 绑定到当前用户"""
     
-    squad = mission_in.get("squad", {})
+    squad = mission_in.get("squad_config") or mission_in.get("squad", {})
     agents = squad.get("agents", [])
     
+    from datetime import datetime
     conv = ConversationModel(
         title=mission_in.get("name", "新任务"),
         user_id=current_user.id,
-        squad_config=squad
+        squad_config=squad,
+        last_active_at=datetime.utcnow()
     )
     db.add(conv)
     db.commit()
@@ -165,24 +167,156 @@ async def update_mission(
     logger.info(f"✏️ 用户{current_user.id} 更新mission {mission_id}")
     return {"ok": True, "message": "更新成功"}
 
-@router.get("")
-async def list_missions(
+
+@router.put("/{mission_id}/pin")
+async def toggle_pin_mission(
+    mission_id: str,
     db: Session = Depends(get_db),
     current_user: UserModel = Depends(get_current_user)
 ):
-    """获取当前用户的所有missions"""
+    """切换mission置顶状态"""
     
-    convs = db.query(ConversationModel).filter(
-        ConversationModel.is_archived == False,
+    try:
+        conv_id = int(mission_id.replace("mis_", ""))
+    except:
+        raise HTTPException(status_code=400, detail="无效的mission ID")
+    
+    conv = db.query(ConversationModel).filter(
+        ConversationModel.id == conv_id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="mission不存在")
+    if conv.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权修改其他用户的mission")
+    
+    conv.is_pinned = not conv.is_pinned
+    db.commit()
+    
+    action = "置顶" if conv.is_pinned else "取消置顶"
+    logger.info(f"📌 用户{current_user.id} {action}mission {mission_id}")
+    return {"ok": True, "is_pinned": conv.is_pinned, "message": f"{action}成功"}
+
+
+@router.put("/{mission_id}/archive")
+async def toggle_archive_mission(
+    mission_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """切换mission归档状态"""
+    
+    try:
+        conv_id = int(mission_id.replace("mis_", ""))
+    except:
+        raise HTTPException(status_code=400, detail="无效的mission ID")
+    
+    conv = db.query(ConversationModel).filter(
+        ConversationModel.id == conv_id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="mission不存在")
+    if conv.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权修改其他用户的mission")
+    
+    conv.is_archived = not conv.is_archived
+    db.commit()
+    
+    action = "归档" if conv.is_archived else "取消归档"
+    logger.info(f"📁 用户{current_user.id} {action}mission {mission_id}")
+    return {"ok": True, "is_archived": conv.is_archived, "message": f"{action}成功"}
+
+@router.get("")
+async def list_missions(
+    search: Optional[str] = None,
+    include_archived: bool = False,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """获取当前用户的所有missions
+    
+    Args:
+        search: 可选，搜索标题
+        include_archived: 是否包含已归档的mission，默认False
+    """
+    
+    query = db.query(ConversationModel).filter(
         ConversationModel.user_id == current_user.id
-    ).order_by(
+    )
+    
+    if not include_archived:
+        query = query.filter(ConversationModel.is_archived == False)
+    
+    if search:
+        query = query.filter(ConversationModel.title.ilike(f"%{search}%"))
+    
+    # 排序：置顶优先(is_pinned desc)，然后按最近活跃(last_active_at desc)
+    convs = query.order_by(
+        ConversationModel.is_pinned.desc(),
         ConversationModel.last_active_at.desc()
     ).all()
     
     missions = []
     for conv in convs:
         mission_data = _make_mission_dict(conv)
+        mission_data["is_pinned"] = conv.is_pinned
+        mission_data["is_archived"] = conv.is_archived
+        mission_data["last_active_at"] = conv.last_active_at.isoformat() if conv.last_active_at else None
         missions.append(mission_data)
     
-    logger.info(f"📋 用户{current_user.id} 已返回 {len(missions)} 个missions")
+    logger.info(f"📋 用户{current_user.id} 已返回 {len(missions)} 个missions (search={search}, include_archived={include_archived})")
     return {"ok": True, "missions": missions}
+
+
+@router.get("/{mission_id}/starred-artifacts")
+async def get_starred_artifacts(
+    mission_id: str,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """获取用户收藏的产物流星列表"""
+    try:
+        conv_id = int(mission_id.replace("mis_", ""))
+    except:
+        raise HTTPException(status_code=400, detail="无效的mission ID")
+    
+    conv = db.query(ConversationModel).filter(
+        ConversationModel.id == conv_id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="mission不存在")
+    if conv.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权查看其他用户的mission")
+    
+    squad = conv.squad_config or {}
+    starred = squad.get("starred_artifacts", [])
+    return {"ok": True, "starred_artifacts": starred}
+
+
+@router.post("/{mission_id}/starred-artifacts")
+async def save_starred_artifacts(
+    mission_id: str,
+    data: dict,
+    db: Session = Depends(get_db),
+    current_user: UserModel = Depends(get_current_user)
+):
+    """保存用户收藏的产物流星列表"""
+    try:
+        conv_id = int(mission_id.replace("mis_", ""))
+    except:
+        raise HTTPException(status_code=400, detail="无效的mission ID")
+    
+    conv = db.query(ConversationModel).filter(
+        ConversationModel.id == conv_id
+    ).first()
+    if not conv:
+        raise HTTPException(status_code=404, detail="mission不存在")
+    if conv.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="无权修改其他用户的mission")
+    
+    squad = conv.squad_config or {}
+    squad["starred_artifacts"] = data.get("starred_artifacts", [])
+    conv.squad_config = squad
+    db.commit()
+    
+    logger.info(f"⭐ 用户{current_user.id} 更新mission {mission_id} 收藏产物: {len(squad['starred_artifacts'])} 个")
+    return {"ok": True, "message": "收藏已保存"}

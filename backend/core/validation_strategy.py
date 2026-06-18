@@ -160,7 +160,7 @@ async def apply_validation_strategy(
             return ValidationResult(passed=True, strategy="llm_judge")
 
     except Exception as exc:
-        logger.warning(f"[validation] apply 失败，视为通过: {exc}")
+        logger.warning(f"[validation] apply 失败，视为通过（config={validation_config}）: {exc}", exc_info=True)
 
     return ValidationResult(passed=True, strategy=strategy or "none")
 

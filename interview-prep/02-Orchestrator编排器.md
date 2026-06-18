@@ -154,6 +154,7 @@ AGENT_FALLBACK_CHAIN = {
 - 通过 `@tool` 装饰器封装为 LangChain Tool
 - 在 ReAct 循环中被 Agent 调用：Agent 思考后选择工具，执行工具，观察结果
 - 适用场景：需要外部 API 调用、文件操作、数据库操作等确定性的行为能力
+- 以 `web_search` 为例，近期做了质量优化：实现了结构化清洗管道——HTML 标签清洗 → Jaccard 标题相似度去重（>80% 视为重复）→ 相关性打分（标题命中权重 3、正文命中权重 1、短内容惩罚、URL 加分）→ 过滤低分结果 → Top-5 排序输出。可配置 `MAX_RESULTS`、`MAX_SNIPPET_LEN`、`MIN_RELEVANCE_SCORE` 等参数控制输出质量
 
 **能力类 Skill（Native Skill）**：
 - 本质是 **Markdown 格式的 prompt 注入**，描述一种能力或工作模式
@@ -226,16 +227,28 @@ Orchestrator 处理边界情况的策略：
 
 **参考答复：**
 
-重规划是动态规划的核心智能体现。当 evaluator 发现子任务输出不满足要求时：
+重规划通过 **ReplanEvaluator**（独立评估器，`replan_evaluator.py`）实现两层决策链路：
 
-1. Evaluator 分析哪些子任务的结果不够好（可能信息不完整、质量不够、需要更多上下文）
-2. 生成新的补充子任务列表（而非重新执行全部任务）
-3. 通过条件边回到 `execute_tasks` 节点
-4. 只执行新增的子任务，保留之前已完成的子任务结果
+**第一层：代码规则引擎（硬条件判定）**——纯代码逻辑，不依赖 LLM，优先级最高：
+1. **重规划次数达上限**（`MAX_REPLAN_LIMIT = 2`）→ 强制降级为直接 LLM 调用
+2. **子任务已重试仍失败**（state == "retried" 且 quality 不通过）→ 触发 replan
+3. **所有子任务都失败**→ 触发 replan（全部重新规划）
+4. **全部通过**→ 直接 complete，跳过 LLM 评估（节省一次调用）
 
-这个设计的优势是 **增量重试** 而非全部重来：已经完成且质量达标的子任务结果会被保留，只有不满足要求的部分才重新执行。这在 token 消耗和响应时间上都更高效。
+**第二层：LLM 语义评估**——仅在硬条件未触发时调用：
+- ReplanEvaluator.evaluate() 分析每个子任务的质量报告
+- 返回 `EvaluationVerdict`：`retry`（重试当前）/ `replan`（重新规划）/ `degrade`（降级为直调 LLM）/ `complete`（通过，进入汇总）
+- 每次评估带有 confidence（置信度 0-1）
 
-为了防止无限重规划，有最大迭代次数限制（`DEFAULT_MAX_ITERATIONS = 10`）。
+**PlanAnalyzer 辅助**（`plan_analyzer.py`）：纯函数模块，从 Planner 输出的 TaskSpec 列表中分析三个维度：
+- 步骤数（1-3=simple, 4-7=moderate, 8+=complex）
+- 依赖深度（≤1=simple, 2=moderate, ≥3=complex）
+- 工具/领域多样性（1=simple, 2-3=moderate, 4+=complex）
+- 综合判定取三个维度的最高级别
+
+**增量重试而非全部重来**：当触发 replan 时，只生成新的**补充**子任务，已通过质量检查的子任务结果保留。`MAX_REPLAN_LIMIT = 2` 防止无限重规划，`MAX_TASK_RETRIES = 3` 限制单个子任务重试次数。
+
+**前端体验**：重规划和降级的进度变化通过 progressive_queue 实时推送，用户能看到"正在重新规划..."的状态更新。
 
 ---
 
@@ -347,9 +360,15 @@ Skill 注入是用户主动启用的能力增强机制：
 
 **瓶颈2：启动时的同步健康检查。** 每个后端需要 8 秒超时，如果后端多或网络慢，启动会变慢。目前是同步的，已标记为可优化为异步。
 
-**瓶颈3：ChromaDB 单客户端。** ChromaDB 的 PersistentClient 锁粒度较大，高并发下可能成为瓶颈。后续可考虑迁移到 ChromaDB 的服务化部署。
+**瓶颈3：ChromaDB 单客户端。** ChromaDB 的 PersistentClient 锁粒度较大，高并发下可能成为瓶颈。
+
+**瓶颈4：ReAct 循环对纯生成任务的不必要消耗。** 文档生成、报告输出等不需要工具调用的任务，走 ReAct 循环会因为 `max_iterations` 限制导致长输出被截断。
 
 **已做的优化**：
+- **纯生成任务跳过 ReAct**：在 `_call_agent_with_tools` 中检测 prompt 是否包含工具关键词（web_search、rag_retrieval 等），如果不含则判定为纯生成任务，`break` 跳出 ReAct 路径，直接走 `process_message()`（无迭代限制，避免长输出截断）
+- **ReAct 工具使用约束注入**：在 ReAct prompt 中加入工具约束提示（最多 3 次调用、连续 2 次空结果停止搜索、禁止重复搜索），减少无效工具调用
+- **可配置 ReAct 步数上限**：Agent 支持 `react_max_iterations` 属性，默认使用全局 `REACT_MAX_ITERATIONS`，不同 Agent 可按需配置
+- **Replan 硬条件判定前置**：在 LLM 语义评估之前先检查硬条件（次数上限、硬失败数），全部通过则跳过 LLM 调用，节省一次 API 消耗
 - 健康检查只 ping 不实际生成（`max_tokens=5`），减少 API 消耗
 - 记忆提取使用 `fire-and-forget`（`asyncio.create_task`），不阻塞主回答
 - 流式输出使用独立队列，避免不同请求的队列竞争

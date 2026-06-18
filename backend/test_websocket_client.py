@@ -1,73 +1,167 @@
+"""
+WebSocket 测试客户端
+
+用法:
+    python test_websocket_client.py
+
+测试 WebSocket 连接和消息收发
+"""
 import asyncio
-import websockets
 import json
-import uuid
-from pprint import pprint
+import websockets
+import sys
 
-# --- 配置 ---
-# 要连接的 WebSocket 服务器地址
-# 确保这里的端口号 (8000) 和你 FastAPI 应用运行的端口一致
-WEBSOCKET_URL = "ws://127.0.0.1:8000/ws/"
+# 配置
+WEBSOCKET_URL = "ws://127.0.0.1:8000/ws/{conversation_id}?token={token}"
 
-# 要测试的指令
-# 我们将 @tongyi 并给出一个需要写代码的任务，以触发工具调用流程
-# 你可以修改这个指令来测试不同的场景
-# 例如: "@echo hello world" 来测试 EchoAgent
-# 或 "@tongyi 解释一下什么是人工智能" 来测试不带工具调用的最终答案
-MESSAGE_TO_SEND = "@tongyi 帮我用 python 写一个斐波那契数列函数"
+# 从 auth.py 复制的 token 创建逻辑（用于测试）
+def create_test_token(user_id: int, secret_key: str = "your-secret-key-keep-it-safe") -> str:
+    """创建测试用 JWT token"""
+    from datetime import datetime, timedelta
+    import base64
+    import hmac
+    
+    header = {"alg": "HS256", "typ": "JWT"}
+    payload = {
+        "sub": str(user_id),
+        "exp": datetime.utcnow() + timedelta(days=30)
+    }
+    
+    import json as json_module
+    header_b64 = base64.urlsafe_b64encode(json_module.dumps(header).encode()).decode().rstrip('=')
+    payload_b64 = base64.urlsafe_b64encode(json_module.dumps(payload).encode()).decode().rstrip('=')
+    
+    signature = hmac.new(
+        secret_key.encode(),
+        f"{header_b64}.{payload_b64}".encode(),
+        hashlib.sha256
+    ).digest()
+    signature_b64 = base64.urlsafe_b64encode(signature).decode().rstrip('=')
+    
+    return f"{header_b64}.{payload_b64}.{signature_b64}"
 
 
-async def run_test_client():
-    """
-    运行一个简单的 WebSocket 客户端来测试 AgentHub。
-    """
-    # 为这次测试创建一个唯一的会话 ID
-    conversation_id = str(uuid.uuid4())
-    uri = f"{WEBSOCKET_URL}{conversation_id}"
-
-    print("=" * 50)
-    print(f"🚀 开始测试 AgentHub WebSocket")
-    print(f"   - 服务器 URI: {uri}")
-    print(f"   - 会话 ID: {conversation_id}")
-    print("=" * 50)
-
+async def test_websocket():
+    """测试 WebSocket 连接"""
+    import hashlib
+    import getpass
+    
+    # 从数据库获取真实 token，或者使用测试 token
+    # 这里假设你有一个有效的 JWT token
+    test_token = None
+    
+    # 尝试从 .env 或环境变量获取 token
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+    
+    # 如果没有预设 token，尝试使用测试 token
+    if not test_token:
+        print("⚠️ 未找到预设 token，尝试使用测试 token...")
+        # 注意：这需要后端 JWT_SECRET 为默认值
+        test_token = create_test_token(1)  # user_id = 1
+    
+    # 对话 ID（可以改成你实际的 conversation_id）
+    conversation_id = 1
+    
+    uri = f"ws://127.0.0.1:8000/ws/{conversation_id}?token={test_token}"
+    
+    print(f"🔌 连接到: {uri[:80]}...")
+    
     try:
-        # 连接到 WebSocket 服务器
-        async with websockets.connect(uri) as websocket:
-            print(f"\n[1/3] 🟢 连接成功！")
-
+        async with websockets.connect(uri) as ws:
+            print("✅ 连接成功！")
+            
             # 发送测试消息
-            print(f"[2/3] 💬 正在发送消息...")
-            print(f"      内容: '{MESSAGE_TO_SEND}'")
-            await websocket.send(MESSAGE_TO_SEND)
-
-            # 等待并接收服务器的回复
-            print(f"[3/3] 📥 正在等待 Agent 的最终回复... (这可能需要一些时间)")
-            response = await websocket.recv()
-
-            print("\n" + "=" * 50)
-            print("🎉 收到最终回复！")
-            print("=" * 50)
-
-            # 解析并格式化打印回复
-            try:
-                response_data = json.loads(response)
-                pprint(response_data)
-            except json.JSONDecodeError:
-                print("收到的回复不是有效的 JSON 格式:")
-                print(response)
-
+            test_message = "你好，请介绍一下你自己"
+            print(f"\n📤 发送消息: {test_message}")
+            
+            await ws.send(json.dumps({
+                "message": test_message,
+                "active_skills": []
+            }))
+            
+            # 接收响应
+            print("\n📥 接收响应中...")
+            message_count = 0
+            final_content = ""
+            
+            async for msg_text in ws:
+                msg = json.loads(msg_text)
+                msg_type = msg.get("type", "unknown")
+                
+                if msg_type == "token":
+                    content = msg.get("content", "")
+                    print(content, end="", flush=True)
+                    final_content += content
+                elif msg_type == "thinking":
+                    status = msg.get("status")
+                    agent = msg.get("agent_id", "agent")
+                    if status == "thinking":
+                        print(f"\n🤔 [{agent}] 思考中...", end="", flush=True)
+                    else:
+                        print(f" ✅")
+                elif msg_type == "intermediate":
+                    print(f"\n📝 [{msg.get('agent_id', 'agent')}] {msg.get('content', '')[:100]}...")
+                elif msg_type == "artifact":
+                    print(f"\n🎨 [产物] {msg.get('title', '未命名')}")
+                elif msg_type == "final":
+                    print(f"\n\n🎉 完成！最终内容长度: {len(final_content)}")
+                    break
+                elif msg_type == "error":
+                    print(f"\n❌ 错误: {msg.get('message', '未知错误')}")
+                    break
+                elif msg_type == "pong":
+                    print("🏓 心跳响应")
+                elif msg_type == "user_message_saved":
+                    print(f"💾 消息已保存: {msg}")
+                else:
+                    print(f"\n收到未知消息类型: {msg_type}")
+                
+                message_count += 1
+                if message_count > 1000:  # 防止无限循环
+                    print("\n⚠️ 消息数量过多，停止接收")
+                    break
+            
+            print(f"\n总共收到 {message_count} 条消息")
+            
     except websockets.exceptions.ConnectionClosedError as e:
-        print(f"\n❌ 连接失败或被关闭: {e}")
-        print("   请确保你的 FastAPI 后端服务正在运行，并且端口号正确。")
+        print(f"\n❌ 连接断开: {e}")
+        return False
     except Exception as e:
-        print(f"\n❌ 测试过程中发生未知错误: {e}")
+        print(f"\n❌ 错误: {e}")
+        return False
+    
+    return True
+
+
+async def test_with_auth_failure():
+    """测试认证失败的情况"""
+    print("\n\n=== 测试认证失败 ===")
+    uri = "ws://127.0.0.1:8000/ws/1?token=invalid_token"
+    
+    try:
+        async with websockets.connect(uri) as ws:
+            print("❌ 不应该成功连接！")
+            return False
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(f"✅ 预期中的断开: {e.code} - {e.reason}")
+        return True
+    except Exception as e:
+        print(f"❌ 连接失败: {e}")
+        return True
 
 
 if __name__ == "__main__":
-    # 运行测试客户端
-    # 如果你遇到 "pip install websockets" 的提示，请在终端中运行它
-    try:
-        asyncio.run(run_test_client())
-    except KeyboardInterrupt:
-        print("\n测试被用户中断。")
+    print("=" * 60)
+    print("AgentHub WebSocket 测试客户端")
+    print("=" * 60)
+    
+    # 运行主要测试
+    success = asyncio.run(test_websocket())
+    
+    if success:
+        print("\n✅ WebSocket 测试通过！")
+    else:
+        print("\n❌ WebSocket 测试失败")
+        sys.exit(1)

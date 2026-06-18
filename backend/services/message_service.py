@@ -1,6 +1,6 @@
 from typing import List, Optional
 from sqlalchemy.orm import Session
-from backend.models.message import Message
+from backend.models.message import Message, create_message_content
 from backend.models.artifact import Artifact
 from backend.utils.logger import logger
 
@@ -10,6 +10,8 @@ def create_message(
     conversation_id: str,
     agent_id: str,
     content: str,
+    message_type: str = "text",
+    metadata: dict = None,
     artifacts: Optional[List[Artifact]] = None
 ) -> Message:
     """
@@ -17,16 +19,22 @@ def create_message(
 
     这会自动处理好 Message 和 Artifact 之间的数据库关系。
     """
-    logger.info(f"正在为会话 {conversation_id} 创建新消息 (Agent: {agent_id})。")
+    logger.info(f"正在为会话 {conversation_id} 创建新消息 (Agent: {agent_id}, type: {message_type})。")
+
+    structured_content = create_message_content(
+        msg_type=message_type,
+        content=content,
+        **(metadata or {})
+    )
+
     db_message = Message(
         conversation_id=conversation_id,
         agent_id=agent_id,
-        content=content
+        content=structured_content
     )
 
     if artifacts:
         logger.info(f"消息附带了 {len(artifacts)} 个产物。")
-        # SQLAlchemy 的 back_populates 和 cascade 设置会自动处理好关联
         db_message.artifacts = artifacts
 
     db.add(db_message)

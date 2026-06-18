@@ -286,16 +286,10 @@ async def search_knowledge(
         return {"results": [], "query": query}
 
     user_id = str(current_user.id) if current_user else "default"
-    results = rag_retrieval(query, top_k=top_k)
-
-    # 过滤：只返回当前用户上传的文档
-    filtered = [
-        r for r in results
-        if r.get("source") and r.get("user_id", user_id) == user_id
-    ]
+    results = rag_retrieval(query, top_k=top_k, user_id=current_user.id if current_user else None)
 
     return {
-        "results": filtered[:top_k],
+        "results": results[:top_k],
         "query": query,
         "total": len(filtered),
     }

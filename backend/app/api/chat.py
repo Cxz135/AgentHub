@@ -25,6 +25,7 @@ class ChatRequest(BaseModel):
     message: str
     agent: Optional[Dict] = None
     mission: Optional[Dict] = None
+    active_skills: Optional[List[str]] = []  # 用户启用的 Skill 列表
 
 # 简单的直接聊天接口，供前端调用
 @router.post("")
@@ -55,11 +56,28 @@ async def simple_chat(
     if conversation_id:
         conversation = conv_service.get_conversation(conversation_id)
         if conversation and conversation.user_id == current_user.id:
+            from datetime import datetime
+            import re
+            # 解析 mentions
+            mention_pattern = r'@([\w\u4e00-\u9fa5]+)'
+            found = re.findall(mention_pattern, chat_req.message)
+            mentioned_agents = []
+            if found and conversation.squad_config:
+                squad = conversation.squad_config or {}
+                agents = squad.get('agents', [])
+                agent_ids = {a.get('id') or a.get('name') for a in agents}
+                agent_names = {a.get('name') for a in agents}
+                for name in found:
+                    if name in agent_ids or name in agent_names:
+                        mentioned_agents.append(name)
             conv_service.add_message_to_conversation(
                 conversation_id=conversation_id,
                 agent_id="user",
-                content=chat_req.message
+                content=chat_req.message,
+                mentions=mentioned_agents if mentioned_agents else None
             )
+            conversation.last_active_at = datetime.utcnow()
+            db.commit()
             logger.info(f"[SIMPLE-CHAT] 用户消息已存入 conversation {conversation_id}")
         else:
             logger.warning(f"[SIMPLE-CHAT] 对话 {conversation_id} 不存在或不属于当前用户")
@@ -82,7 +100,10 @@ async def simple_chat(
             response = await orchestrator.get_chat_response(
                 conversation_id=temp_conv_id,
                 messages=all_messages,
-                request_context={"current_user_id": current_user.id}
+                request_context={
+                    "current_user_id": current_user.id,
+                    "active_skills": chat_req.active_skills or []
+                }
             )
             if isinstance(response, dict) and "content" in response:
                 reply_content = response["content"]
@@ -176,6 +197,9 @@ async def send_message(
         agent_id="user",
         content=message_in.content
     )
+    from datetime import datetime
+    conversation.last_active_at = datetime.utcnow()
+    db.commit()
     logger.info(f"[CHAT API] 用户消息已存入数据库，消息 ID: {user_message.id}。")
 
     # 3. 调用 Orchestrator 处理任务
@@ -293,6 +317,9 @@ async def _chat_stream_impl(req: ChatStreamRequest, current_user: UserModel) -> 
             agent_id="user",
             content=req.message,
         )
+        from datetime import datetime
+        conversation.last_active_at = datetime.utcnow()
+        db.commit()
         yield _sse("user_message_saved", {
             "message_id": user_msg.id,
             "conversation_id": conversation_id,
@@ -331,7 +358,10 @@ async def _chat_stream_impl(req: ChatStreamRequest, current_user: UserModel) -> 
                 async for chunk in orchestrator.get_chat_stream(
                     conversation_id=conversation_id or 0,
                     messages=history,
-                    request_context={"current_user_id": current_user.id},
+                    request_context={
+                        "current_user_id": current_user.id,
+                        "active_skills": req.active_skills or []
+                    },
                     agent_override=agent_cfg if agent_cfg else None,
                 ):
                     kind = chunk.get("type")
@@ -404,7 +434,10 @@ async def _chat_stream_impl(req: ChatStreamRequest, current_user: UserModel) -> 
             response = await orchestrator.get_chat_response(
                 conversation_id=conversation_id or 0,
                 messages=history,
-                request_context={"current_user_id": current_user.id},
+                request_context={
+                    "current_user_id": current_user.id,
+                    "active_skills": req.active_skills or []
+                },
                 agent_override=agent_cfg if agent_cfg else None,
             )
             if isinstance(response, dict):
